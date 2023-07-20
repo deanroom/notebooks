@@ -1,0 +1,23 @@
+ Ignore files and directories that are created by macOS.
+.DS_Store
+__MACOSX
+
+# Ignore temporary files.
+*.tmp
+*.swp
+*~
+
+# Ignore build artifacts.
+*.o
+*.a
+*.so
+
+# Ignore binaries.
+*.app
+*.exe
+*.dll
+
+# Ignore documentation.
+*.doc
+*.pdf
+*.txt
