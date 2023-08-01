@@ -699,7 +699,7 @@ If the mutex must be initialized at runtime (which is the case if it is allocate
      void init_MUTEX_LOCKED(struct semaphore *sem);
 ```
 
-In the Linux world, the P function is called down—or some variation of that name. Here, “down” refers to the fact that the function decrements the value of the sema- phore and, perhaps after putting the caller to sleep for a while to wait for the sema- phore to become available, grants access to the protected resources. There are three versions of down:
+In the Linux world, the P function is called down—or some variation of that name. Here, “down” refers to the fact that the function decrements the value of the semaphore and, perhaps after putting the caller to sleep for a while to wait for the semaphore to become available, grants access to the protected resources. There are three versions of down:
 
 ```c
      void down(struct semaphore *sem);
@@ -1013,7 +1013,7 @@ This chapter examines a few concepts that you need to understand to write fully 
 
 ### ioctl
 
-Most drivers need—in addition to the ability to read and write the device—the abil- ity to perform various types of hardware control via the device driver. Most devices can perform operations beyond simple data transfers; user space must often be able to request, for example, that the device lock its door, eject its media, report error information, change a baud rate, or self destruct. These operations are usually sup- ported via the ioctl method, which implements the system call by the same name.
+Most drivers need—in addition to the ability to read and write the device—the ability to perform various types of hardware control via the device driver. Most devices can **perform operations beyond simple data transfers**; user space must often be able to request, for example, that the device lock its door, eject its media, report error information, change a baud rate, or self destruct. These operations are usually sup- ported via the ioctl method, which implements the system call by the same name.
 In user space, the ioctl system call has the following prototype:
 
 ```c
@@ -1023,12 +1023,283 @@ int ioctl(int fd, unsigned long cmd, ...);
 The ioctl driver method has a prototype that differs somewhat from the user-space version:
 
 ```c
-     int (*ioctl) (struct inode *inode, struct file *filp,
-                   unsigned int cmd, unsigned long arg);
+int (*ioctl) (struct inode *inode, struct file *filp,
+             unsigned int cmd, unsigned long arg);
 ```
+
+Each ioctl command is, essentially, a separate, usually undocu- mented system call, and there is no way to audit these calls in any sort of comprehensive manner
 
 #### Choosing the ioctl Commands
 
 To help programmers create unique ioctl command codes, these codes have been split up into several bitfields. The first versions of Linux used 16-bit numbers: the top eight were the “magic” numbers associated with the device, and the bottom eight were a sequential number, unique within the device. This happened because Linus was “clueless” (his own word); a better division of bitfields was conceived only later. Unfortunately, quite a few drivers still use the old convention. They have to: chang- ing the command codes would break no end of binary programs, and that is not something the kernel developers are willing to do.
 
+To choose ioctl numbers for your driver according to the Linux kernel convention, you should first check include/asm/ioctl.h and Documentation/ioctl-number.txt. The header defines the bitfields you will be using: type (magic number), ordinal number, direction of transfer, and size of argument. The ioctl-number.txt file lists the magic numbers used throughout the kernel,\* so you’ll be able to choose your own magic number and avoid overlaps. The text file also lists the reasons why the convention should be used.
 
+We chose to implement both ways of passing integer arguments: by pointer and by explicit value (although, by an established convention, ioctl should exchange values by pointer). Similarly, both ways are used to return an integer number: by pointer or by setting the return value. This works as long as the return value is a positive inte- ger; as you know by now, on return from any system call, a positive value is pre- served (as we saw for read and write), while a negative value is considered an error and is used to set errno in user space.
+
+#### The Return Value\
+
+The implementation of ioctl is usually a switch statement based on the command number. But what should the default selection be when the command number doesn’t match a valid operation? The question is controversial. Several kernel func- tions return -EINVAL (“Invalid argument”), which makes sense because the com- mand argument is indeed not a valid one. The POSIX standard, however, states that if an inappropriate ioctl command has been issued, then -ENOTTY should be returned. This error code is interpreted by the C library as “inappropriate ioctl for device,” which is usually exactly what the programmer needs to hear. It’s still pretty com- mon, though, to return -EINVAL in response to an invalid ioctl command.
+
+#### The Predefined Commands
+
+Although the ioctl system call is most often used to act on devices, a few commands are recognized by the kernel. Note that these commands, when applied to your device, are decoded before your own file operations are called. Thus, if you choose the same number for one of your ioctl commands, you won’t ever see any request for that command, and the application gets something unexpected because of the con- flict between the ioctl numbers.
+
+The predefined commands are divided into three groups:
+
+- Those that can be issued on any file (regular, device, FIFO, or socket)
+- Those that are issued only on regular files
+- Those specific to the filesystem type
+
+Commands in the last group are executed by the implementation of the hosting file- system (this is how the chattr command works). Device driver writers are interested only in the first group of commands, whose magic number is “T.” Looking at the workings of the other groups is left to the reader as an exercise; ext2_ioctl is a most interesting function (and easier to understand than one might expect), because it implements the append-only flag and the immutable flag.
+
+#### Using the ioctl Argument
+
+When a pointer is used to refer to user space, we must ensure that the user address is valid. An attempt to access an unverified user-supplied pointer can lead to incorrect behavior, a kernel oops, system corruption, or security problems. It is the driver’s responsibility to make proper checks on every user-space address it uses and to return an error if it is invalid.
+
+To start, address verification (without transferring data) is implemented by the function access_ok, which is declared in <asm/uaccess.h>:
+
+```c
+int access_ok(int type, const void *addr, unsigned long size);
+```
+
+The first argument should be either VERIFY_READ or VERIFY_WRITE, depending on whether the action to be performed is reading the user-space memory area or writing it. The addr argument holds a user-space address, and size is a byte count.
+
+In addition to the copy_from_user and copy_to_user functions, the programmer can exploit a set of functions that are optimized for the most used data sizes (one, two, four, and eight bytes). These functions are described in the following list and are defined in <asm/ uaccess.h>:
+
+```c
+put_user(datum, ptr)
+__put_user(datum, ptr)
+get_user(local, ptr)
+__get_user(local, ptr)
+
+```
+
+If an attempt is made to use one of the listed functions to transfer a value that does not fit one of the specific sizes, the result is usually a strange message from the com- piler, such as “conversion to non-scalar type requested.” In such cases, copy_to_user or copy_from_user must be used.
+
+#### Capabilities and Restricted Operations
+
+The Linux kernel pro- vides a more flexible system called capabilities. A capability-based system leaves the all-or-nothing mode behind and breaks down privileged operations into separate subgroups. In this way, a particular user (or program) can be empowered to perform a specific privileged operation without giving away the ability to perform other, unre- lated operations. The kernel uses capabilities exclusively for permissions manage- ment and exports two system calls capget and capset, to allow them to be managed from user space.
+
+The full set of capabilities can be found in <linux/capability.h>. These are the only capabilities known to the system; it is not possible for driver authors or system admin- istrators to define new ones without modifying the kernel source. A subset of those capabilities that might be of interest to device driver writers includes the following:
+
+CAP_DAC_OVERRIDE
+The ability to override access restrictions (data access control, or DAC) on files and directories.
+CAP_NET_ADMIN
+The ability to perform network administration tasks, including those that affect network interfaces.
+CAP_SYS_MODULE
+The ability to load or remove kernel modules.
+CAP_SYS_RAWIO
+The ability to perform “raw” I/O operations. Examples include accessing device ports or communicating directly with USB devices.
+CAP_SYS_ADMIN
+A catch-all capability that provides access to many system administration opera- tions.
+CAP_SYS_TTY_CONFIG
+The ability to perform tty configuration tasks.
+
+Before performing a privileged operation, a device driver should check that the call- ing process has the appropriate capability; failure to do so could result user pro- cesses performing unauthorized operations with bad results on system stability or security. Capability checks are performed with the capable function (defined in <linux/sched.h>):
+
+```c
+int capable(int capability);
+```
+
+In the scull sample driver, any user is allowed to query the quantum and quantum set sizes. Only privileged users, however, may change those values, since inappropriate values could badly affect system performance. When needed, the scull implementa- tion of ioctl checks a user’s privilege level as follows:
+
+```c
+if (! capable (CAP_SYS_ADMIN))
+      return -EPERM;
+```
+
+In the absence of a more specific capability for this task, CAP_SYS_ADMIN was chosen for this test.
+
+#### The Implementation of the ioctl Commands
+
+#### Device Control Without ioctl
+
+Sometimes controlling the device is better accomplished by writing control sequences to the device itself. For example, this technique is used in the console driver, where so-called escape sequences are used to move the cursor, change the default color, or perform other configuration tasks. The benefit of implementing device control this way is that the user can control the device just by writing data, without needing to use (or sometimes write) programs built just for configuring the device. When devices can be controlled in this manner, the program issuing commands often need not even be running on the same system as the device it is controlling.
+
+The drawback of controlling by printing is that it adds policy constraints to the device; for example, it is viable only if you are sure that the control sequence can’t appear in the data being written to the device during normal operation. This is only partly true for ttys. Although a text display is meant to display only ASCII charac- ters, sometimes control characters can slip through in the data being written and can, therefore, affect the console setup. This can happen, for example, when you cat a binary file to the screen; the resulting mess can contain anything, and you often end up with the wrong font on your console.
+
+Controlling by write is definitely the way to go for those devices that don’t transfer data but just respond to commands, such as robotic devices.
+
+When writing command-oriented drivers, there’s no reason to implement the ioctl method. An additional command in the interpreter is easier to implement and use.
+
+### Blocking I/O
+
+A call to read may come when no data is available, but more is expected in the future. Or a process could attempt to write, but your device is not ready to accept the data, because your output buffer is full. The calling process usually does not care about such issues; the programmer simply expects to call read or write and have the call return after the necessary work has been done. So, in such cases, your driver should (by default) block the process, putting it to sleep until the request can proceed.
+
+This section shows how to put a process to sleep and wake it up again later on. As usual, however, we have to explain a few concepts first.
+
+#### Introduction to Sleeping
+
+A couple of rules that you must keep in mind to be able to code sleeps in a safe manner.
+
+- The first of these rules is: **never sleep when you are running in an atomic context**. What that means, with regard to sleeping, is that your driver cannot sleep while holding a spinlock, seqlock, or RCU lock. You also cannot sleep if you have disabled interrupts. It is legal to sleep while holding a semaphore, but you should look very carefully at any code that does so. If code sleeps while holding a sema- phore, any other thread waiting for that semaphore also sleeps. So any sleeps that happen while holding semaphores should be short, and you should convince your- self that, by holding the semaphore, you are not blocking the process that will even- tually wake you up.
+
+- Another thing to remember with sleeping is that, **when you wake up, you never know how long your process may have been out of the CPU or what may have changed in the mean time**. You also do not usually know if another process may have been sleeping for the same event; that process may wake before you and grab whatever resource you were waiting for. The end result is that you can make no assumptions about the state of the system after you wake up, and **you must check to ensure that the condition you were waiting for is, indeed, true.**
+
+- One other relevant point, of course, is that **your process cannot sleep unless it is assured that somebody else, somewhere, will wake it up**. The code doing the awakening must also be able to find your process to be able to do its job. Making sure that a wakeup happens is a matter of thinking through your code and knowing, for each sleep, exactly what series of events will bring that sleep to an end. Making it possible for your sleeping process to be found is, instead, accomplished through a data structure called a wait queue. A wait queue is just what it sounds like: a list of processes, all waiting for a specific event.
+
+In Linux, a wait queue is managed by means of a “wait queue head,” a structure of type wait_queue_head_t, which is defined in <linux/wait.h>. A wait queue head can be defined and initialized statically with:
+
+```c
+     DECLARE_WAIT_QUEUE_HEAD(name);
+```
+
+or dynamically as follows:
+
+```c
+     wait_queue_head_t my_queue;
+     init_waitqueue_head(&my_queue);
+```
+
+#### Simple Sleeping
+
+When a process sleeps, it does so in expectation that some condition will become true in the future. As we noted before, any process that sleeps must check to be sure that the condition it was waiting for is really true when it wakes up again. The sim- plest way of sleeping in the Linux kernel is a macro called wait_event (with a few variants); it combines handling the details of sleeping with a check on the condition a process is waiting for. The forms of wait_event are:
+
+```c
+     wait_event(queue, condition)
+     wait_event_interruptible(queue, condition)
+     wait_event_timeout(queue, condition, timeout)
+     wait_event_interruptible_timeout(queue, condition, timeout)
+```
+
+In all of the above forms, queue is the wait queue head to use. Notice that it is passed “by value.” The condition is an arbitrary boolean expression that is evaluated by the macro before and after sleeping; until condition evaluates to a true value, the pro- cess continues to sleep. Note that condition may be evaluated an arbitrary number of times, so it should not have any side effects.
+
+The other half of the picture, of course, is waking up. Some other thread of execu- tion (a different process, or an interrupt handler, perhaps) has to perform the wakeup for you, since your process is, of course, asleep. The basic function that wakes up sleeping processes is called wake_up. It comes in several forms (but we look at only two of them now):
+
+```c
+     void wake_up(wait_queue_head_t *queue);
+     void wake_up_interruptible(wait_queue_head_t *queue);
+```
+
+> [Windows Synchonsization](https://learn.microsoft.com/en-us/windows/win32/sync/about-synchronization)
+>
+> To synchronize access to a resource, use one of the synchronization objects in one of the wait functions. The state of a synchronization object is either signaled or nonsignaled. The wait functions allow a thread to block its own execution until a specified nonsignaled object is set to the signaled state. For more information, see Interprocess Synchronization.
+>
+> **Synchronization Objects**
+>
+> - Event
+>   Notifies one or more waiting threads that an event has occurred. For more information, see [Event Objects](https://learn.microsoft.com/en-us/windows/win32/sync/event-objects).
+> - Mutex
+>   Can be owned by only one thread at a time, enabling threads to coordinate mutually exclusive access to a shared resource. For more information, see [Mutex Objects](https://learn.microsoft.com/en-us/windows/win32/sync/mutex-objects).
+> - Semaphore
+>   Maintains a count between zero and some maximum value, limiting the number of threads that are simultaneously accessing a shared resource. For more information, see [Semaphore Objects](https://learn.microsoft.com/en-us/windows/win32/sync/semaphore-objects).
+> - Waitable timer
+>   Notifies one or more waiting threads that a specified time has arrived. For more information, see [Waitable Timer Objects](https://learn.microsoft.com/en-us/windows/win32/sync/waitable-timer-objects).
+>
+> [Condition Variables](https://learn.microsoft.com/en-us/windows/win32/sync/condition-variables)
+> Condition variables are synchronization primitives that enable threads to wait until a particular condition occurs. Condition variables are **user-mode objects** that cannot be shared across processes.
+> Condition variables enable threads to atomically release a lock and enter the sleeping state. They can be used with critical sections or slim reader/writer (SRW) locks. Condition variables support operations that "wake one" or "wake all" waiting threads. After a thread is woken, it re-acquires the lock it released when the thread entered the sleeping state.
+>
+> [Critical Section Objects](https://learn.microsoft.com/en-us/windows/win32/sync/critical-section-objects)
+> A critical section object provides synchronization similar to that provided by a mutex object, except that **a critical section can be used only by the threads of a single process**. Critical section objects cannot be shared across processes.
+
+#### Blocking and Nonblocking Operations
+
+In the case of a blocking operation, which is the default, the following behavior should be implemented in order to adhere to the standard semantics:
+
+- If a process calls read but no data is (yet) available, the process must block. The process is awakened as soon as some data arrives, and that data is returned to the caller, even if there is less than the amount requested in the count argument to the method.
+- If a process calls write and there is no space in the buffer, the process must block, and it must be on a different wait queue from the one used for reading. When some data has been written to the hardware device, and space becomes free in the output buffer, the process is awakened and the write call succeeds, although the data may be only partially written if there isn’t room in the buffer for the count bytes that were requested.
+
+Both these statements assume that there are both input and output buffers; in practice, almost every device driver has them. The input buffer is required to avoid los- ing data that arrives when nobody is reading. In contrast, data can’t be lost on write, because if the system call doesn’t accept data bytes, they remain in the user-space buffer. Even so, the output buffer is almost always useful for squeezing more perfor- mance out of the hardware.
+
+The behavior of read and write is different if O_NONBLOCK is specified. In this case, the calls simply return -EAGAIN (“try it again”) if a process calls read when no data is available or if it calls write when there’s no space in the buffer.
+
+As you might expect, nonblocking operations return immediately, allowing the application to poll for data. Applications must be careful when using the stdio func- tions while dealing with nonblocking files, because they can easily mistake a non- blocking return for EOF. They always have to check errno.
+
+Only the read, write, and open file operations are affected by the nonblocking flag.
+
+#### A Blocking I/O Example
+
+```c
+struct scull_pipe {
+  wait_queue_head_t inq, outq;
+  char *buffer, *end;
+  int buffersize;
+  char *rp, *wp;
+  int nreaders, nwriters;
+  struct fasync_struct *async_queue; /* asynchronous readers */
+  struct semaphore sem;              /* mutual exclusion semaphore */
+  struct cdev cdev;                  /* Char device structure */
+};
+
+static ssize_t scull_p_read (struct file *filp, char __user *buf, size_t count, loff_t *f_pos)
+{
+    struct scull_pipe *dev = filp->private_data;
+
+    if (down_interruptible(&dev->sem))
+        return -ERESTARTSYS;
+
+    while (dev->rp == dev->wp) { /* nothing to read */ up(&dev->sem); /* release the lock */
+        up(&dev->sem); /* release the lock */
+        if (filp->f_flags & O_NONBLOCK)
+                return -EAGAIN;
+        PDEBUG("\"%s\" reading: going to sleep\n", current->comm);
+        if (wait_event_interruptible(dev->inq, (dev->rp != dev->wp)))
+            return -ERESTARTSYS; /* signal: tell the fs layer to handle it */
+        /* otherwise loop, but first reacquire the lock */
+        if (down_interruptible(&dev->sem))
+    }
+
+    /* ok, data is there, return something */
+    if (dev->wp > dev->rp)
+        count = min(count, (size_t)(dev->wp - dev->rp));
+    else /* the write pointer has wrapped, return data up to dev->end */
+        count = min(count, (size_t)(dev->end - dev->rp));
+    if (copy_to_user(buf, dev->rp, count)) {
+        up (&dev->sem);
+        return -EFAULT;
+    }
+    dev->rp += count;
+    if (dev->rp == dev->end)
+        dev->rp = dev->buffer; /* wrapped */
+    up (&dev->sem);
+    /* finally, awake any writers and return */
+    wake_up_interruptible(&dev->outq);
+    PDEBUG("\"%s\" did read %li bytes\n",current->comm, (long)count);
+    return count;
+}
+
+```
+
+#### Advanced Sleeping
+
+##### How a process sleeps
+##### Manual sleeps
+##### Exclusive waits
+##### The details of waking up
+##### Ancient history: sleep_on
+##### Testing the Scullpipe Driver
+```c
+int main(int argc, char **argv)
+    {
+        int delay = 1, n, m = 0;
+        if (argc > 1)
+            delay=atoi(argv[1]);
+        fcntl(0, F_SETFL, fcntl(0,F_GETFL) | O_NONBLOCK); /* stdin */
+        fcntl(1, F_SETFL, fcntl(1,F_GETFL) | O_NONBLOCK); /* stdout */
+        while (1) {
+            n = read(0, buffer, 4096);
+            if (n >= 0)
+                m = write(1, buffer, n);
+            if ((n < 0 || m < 0) && (errno != EAGAIN))
+                break;
+            sleep(delay);
+        }
+        perror(n < 0 ? "stdin" : "stdout");
+        exit(1);
+}
+
+```
+
+### poll and select
+
+Applications that use nonblocking I/O often use the poll, select, and epoll system calls as well. poll, select, and epoll have essentially the same functionality: **each allows a process to determine whether it can read from or write to one or more open files without blocking**. These calls can also block a process until any of a given set of file descriptors becomes available for reading or writing. Therefore, they are often used in applications that must use multiple input or output streams without getting stuck on any one of them.
+
+Support for any of these calls requires support from the device driver. This support (for all three calls) is provided through the driver’s poll method. This method has the following prototype:
+```c
+     unsigned int (*poll) (struct file *filp, poll_table *wait);
+```
+The driver method is called whenever the user-space program performs a poll, select, or epoll system call involving a file descriptor associated with the driver. The device method is in charge of these two steps:
+1. Call poll_wait on one or more wait queues that could indicate a change in the poll status. If no file descriptors are currently available for I/O, the kernel causes the process to wait on the wait queues for all file descriptors passed to the sys- tem call.
+2. Return a bit mask describing the operations (if any) that could be immediately performed without blocking.
