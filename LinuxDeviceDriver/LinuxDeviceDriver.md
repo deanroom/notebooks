@@ -1265,11 +1265,17 @@ static ssize_t scull_p_read (struct file *filp, char __user *buf, size_t count, 
 #### Advanced Sleeping
 
 ##### How a process sleeps
+
 ##### Manual sleeps
+
 ##### Exclusive waits
+
 ##### The details of waking up
+
 ##### Ancient history: sleep_on
+
 ##### Testing the Scullpipe Driver
+
 ```c
 int main(int argc, char **argv)
     {
@@ -1297,9 +1303,649 @@ int main(int argc, char **argv)
 Applications that use nonblocking I/O often use the poll, select, and epoll system calls as well. poll, select, and epoll have essentially the same functionality: **each allows a process to determine whether it can read from or write to one or more open files without blocking**. These calls can also block a process until any of a given set of file descriptors becomes available for reading or writing. Therefore, they are often used in applications that must use multiple input or output streams without getting stuck on any one of them.
 
 Support for any of these calls requires support from the device driver. This support (for all three calls) is provided through the driver’s poll method. This method has the following prototype:
+
 ```c
      unsigned int (*poll) (struct file *filp, poll_table *wait);
 ```
+
 The driver method is called whenever the user-space program performs a poll, select, or epoll system call involving a file descriptor associated with the driver. The device method is in charge of these two steps:
+
 1. Call poll_wait on one or more wait queues that could indicate a change in the poll status. If no file descriptors are currently available for I/O, the kernel causes the process to wait on the wait queues for all file descriptors passed to the sys- tem call.
 2. Return a bit mask describing the operations (if any) that could be immediately performed without blocking.
+
+#### Interaction with read and write
+
+##### Reading data from the device
+
+- If there is data in the input buffer, the read call should return immediately, with no noticeable delay, even if less data is available than the application requested, and the driver is sure the remaining data will arrive soon. You can always return less data than you’re asked for if this is convenient for any reason (we did it in scull), provided you return at least one byte. In this case, poll should return POLLIN|POLLRDNORM.
+- If there is no data in the input buffer, by default read must block until at least one byte is there. If O_NONBLOCK is set, on the other hand, read returns immedi- ately with a return value of -EAGAIN (although some old versions of System V return 0 in this case). In these cases, poll must report that the device is unread- able until at least one byte arrives. As soon as there is some data in the buffer, we fall back to the previous case.
+- If we are at end-of-file, read should return immediately with a return value of 0, independent of O_NONBLOCK. poll should report POLLHUP in this case.
+
+##### Writing to the device
+
+- If there is space in the output buffer, write should return without delay. It can accept less data than the call requested, but it must accept at least one byte. In this case, poll reports that the device is writable by returning POLLOUT|POLLWRNORM.
+- If the output buffer is full, by default write blocks until some space is freed. If O_NONBLOCK is set, write returns immediately with a return value of -EAGAIN (older System V Unices returned 0). In these cases, poll should report that the file is not writable. If, on the other hand, the device is not able to accept any more data, write returns -ENOSPC (“No space left on device”), independently of the setting of O_NONBLOCK.
+- Never make a write call wait for data transmission before returning, even if O_NONBLOCK is clear. This is because many applications use select to find out whether a write will block. If the device is reported as writable, the call must not block. If the program using the device wants to ensure that the data it enqueues in the output buffer is actually transmitted, the driver must provide an fsync method. For instance, a removable device should have an fsync entry point.??? (I don't understand this--Jerry)
+
+#### Flushing pending output
+
+We’ve seen how the write method by itself doesn’t account for all data output needs. The fsync function, invoked by the system call of the same name, fills the gap. This method’s prototype is
+
+```c
+      int (*fsync) (struct file *file, struct dentry *dentry, int datasync);
+```
+
+If some application ever needs to be assured that data has been sent to the device, the fsync method must be implemented regardless of whether O_NONBLOCK is set. A call to fsync should return only when the device has been completely flushed (i.e., the out- put buffer is empty), even if that takes some time. The datasync argument is used to distinguish between the fsync and fdatasync system calls; as such, it is only of inter- est to filesystem code and can be ignored by drivers.
+
+#### The Underlying Data Structure
+
+Whenever a user application calls poll, select, or epoll_ctl, the kernel invokes the poll method of all files referenced by the system call, passing the same poll_table to each of them. The poll_table structure is just a wrapper around a func- tion that builds the actual data structure. That structure, for poll and select, is a linked list of memory pages containing poll_table_entry structures. Each poll_table_entry holds the struct file and wait_queue_head_t pointers passed to poll_wait, along with an associated wait queue entry. The call to poll_wait sometimes also adds the process to the given wait queue. The whole structure must be maintained by the kernel so that the process can be removed from all of those queues before poll or select returns.
+
+#### Asynchronous Notification
+
+Let’s imagine a process that executes a long computational loop at low priority but needs to process incoming data as soon as possible. If this process is responding to new observations available from some sort of data acquisition peripheral, it would like to know immediately when new data is available. This application could be writ- ten to call poll regularly to check for data, but, for many situations, there is a better way. By enabling asynchronous notification, this application can receive a signal whenever data becomes available and need not concern itself with polling.
+
+User programs have to execute two steps to enable asynchronous notification from an input file. First, they specify a process as the “owner” of the file. When a process invokes the F_SETOWN command using the fcntl system call, the process ID of the owner process is saved in filp->f_owner for later use. This step is necessary for the kernel to know just whom to notify. In order to actually enable asynchronous notifi- cation, the user programs must set the FASYNC flag in the device by means of the F_SETFL fcntl command.
+
+After these two calls have been executed, the input file can request delivery of a SIGIO signal whenever new data arrives. The signal is sent to the process (or process group, if the value is negative) stored in filp->f_owner.
+
+##### The Driver’s Point of View
+
+A more relevant topic for us is how the device driver can implement asynchronous signaling. The following list details the sequence of operations from the kernel’s point of view:
+
+1. When F_SETOWN is invoked, nothing happens, except that a value is assigned to filp->f_owner.
+2. When F_SETFL is executed to turn on FASYNC, the driver’s fasync method is called. This method is called whenever the value of FASYNC is changed in filp->f_flags to notify the driver of the change, so it can respond properly. The flag is cleared by default when the file is opened. We’ll look at the standard implementation of the driver method later in this section.
+3. When data arrives, all the processes registered for asynchronous notification must be sent a SIGIO signal.
+
+### Seeking a Device
+
+#### The llseek Implementation
+
+### Access Control on a Device File
+
+Offering access control is sometimes vital for the reliability of a device node. Not only should unauthorized users not be permitted to use the device (a restriction is enforced by the filesystem permission bits), but sometimes only one authorized user should be allowed to open the device at a time.
+
+#### Single-Open Devices
+
+Allowing only a single process to open a device has undesirable properties, but it is also the easiest access control to implement for a device driver.
+
+#### Restricting Access to a Single User at a Time
+
+The next step beyond a single-open device is to let a single user open a device in mul- tiple processes but allow only one user to have the device open at a time.
+
+#### Blocking open as an Alternative to EBUSY
+
+The alternative to EBUSY, as you may have guessed, is to implement blocking open.
+
+The problem with a blocking-open implementation is that it is really unpleasant for the interactive user, who has to keep guessing what is going wrong.
+
+This kind of problem (a need for different, incompatible policies for the same device) is often best solved by implementing one device node for each access policy. An example of this practice can be found in the Linux tape driver, which provides multi- ple device files for the same device. Different device files will, for example, cause the drive to record with or without compression, or to automatically rewind the tape when the device is closed.
+
+#### Cloning the Device on open
+
+Another technique to manage access control is to create different private copies of the device, depending on the process opening it.
+
+When copies of the device are created by the software driver, we call them virtual devices—just as virtual consoles use a single physical tty device.
+
+#### Quick Reference
+
+This chapter introduced the following symbols and header files:
+
+```c
+#include <linux/ioctl.h>
+#include <asm/uaccess.h>
+#include <linux/capability.h>
+#include <linux/wait.h>
+#include <linux/sched.h>
+```
+
+Declares all the macros used to define ioctl commands. It is currently included by <linux/fs.h>.
+
+## Time, Delays, and Deferred Work
+
+### Measuring Time Lapses
+
+Timer interrupts are generated by the system’s timing hardware at regular intervals; this interval is programmed at boot time by the kernel according to the value of HZ, which is an architecture-dependent value defined in <linux/param.h> or a subplat- form file included by it. Default values in the distributed kernel source range from 50 to 1200 ticks per second on real hardware, down to 24 for software simulators. Most platforms run at 100 or 1000 interrupts per second; the popular x86 PC defaults to 1000, although it used to be 100 in previous versions (up to and including 2.4). As a general rule, even if you know the value of HZ, you should never count on that spe- cific value when programming.
+
+#### Using the jiffies Counter
+
+Timer interrupts are generated by the system’s timing hardware at regular intervals; this interval is programmed at boot time by the kernel according to the value of HZ, which is an architecture-dependent value defined in <linux/param.h> or a subplat- form file included by it. Default values in the distributed kernel source range from 50 to 1200 ticks per second on real hardware, down to 24 for software simulators. Most platforms run at 100 or 1000 interrupts per second; the popular x86 PC defaults to 1000, although it used to be 100 in previous versions (up to and including 2.4). As a general rule, even if you know the value of HZ, you should never count on that spe- cific value when programming.
+
+The counter and the utility functions to read it live in <linux/jiffies.h>, although you’ll usually just include <linux/sched.h>, that automatically pulls jiffies.h in. Need- less to say, both jiffies and jiffies_64 must be considered read-only.
+
+To compare your cached value (like stamp_1 above) and the current value, you should use one of the following macros:
+
+```c
+
+     #include <linux/jiffies.h>
+     int time_after(unsigned long a, unsigned long b);
+     int time_before(unsigned long a, unsigned long b);
+     int time_after_eq(unsigned long a, unsigned long b);
+     int time_before_eq(unsigned long a, unsigned long b);
+```
+
+#### Processor-Specific Registers
+
+In modern processors, the pressing demand for empirical performance figures is thwarted by the intrinsic unpredictability of instruction timing in most CPU designs due to cache memories, instruction scheduling, and branch prediction. As a response, CPU manufacturers introduced a way to count clock cycles as an easy and reliable way to measure time lapses. Therefore, most modern processors include a counter register that is steadily incremented once at each clock cycle. Nowadays, this clock counter is the only reliable way to carry out high-resolution timekeeping tasks.
+
+### Knowing the Current Time
+
+It’s quite unlikely that a driver will ever need to know the wall-clock time, expressed in months, days, and hours; the information is usually needed only by user pro- grams such as cron and syslogd. Dealing with real-world time is usually best left to user space, where the C library offers better support; besides, such code is often too policy-related to belong in the kernel.
+
+There is a kernel function that turns a wall- clock time into a jiffies value, however:
+
+```c
+     #include <linux/time.h>
+     unsigned long mktime (unsigned int year, unsigned int mon,
+                           unsigned int day, unsigned int hour,
+                           unsigned int min, unsigned int sec);
+```
+
+To repeat: dealing directly with wall-clock time in a driver is often a sign that policy is being implemented and should therefore be questioned.
+
+### Delaying Execution
+
+#### Long Delays
+
+Occasionally a driver needs to delay execution for relatively long periods—more than one clock tick. There are a few ways of accomplishing this sort of delay; we start with the simplest technique, then proceed to the more advanced techniques.
+
+##### Busy waiting
+
+If you want to delay execution by a multiple of the clock tick, allowing some slack in the value, the easiest (though not recommended) implementation is a loop that mon- itors the jiffy counter. The busy-waiting implementation usually looks like the follow- ing code, where j1 is the value of jiffies at the expiration of the delay:
+
+```c
+while (time_before(jiffies, j1)) cpu_relax( );
+```
+
+In any case, this approach should definitely be avoided whenever possible. We show it here because on occasion you might want to run this code to better understand the internals of other code.
+
+##### Yielding the processor
+
+As we have seen, busy waiting imposes a heavy load on the system as a whole; we would like to find a better technique. The first change that comes to mind is to xplicitly release the CPU when we’re not interested in it. This is accomplished by calling the schedule function, declared in <linux/sched.h>:
+
+```c
+while (time_before(jiffies, j1)) { schedule( );
+}
+
+```
+
+However, is still isn’t optimal. The current process does nothing but release the CPU, but it remains in the run queue. If it is the only runnable process, it actually runs (it calls the scheduler, which selects the same process, which calls the scheduler, which...). In other words, the load of the machine (the average number of running processes) is at least one, and the idle task (process number 0, also called swapper for historical reasons) never runs.
+
+##### Timeouts
+
+But the best way to implement a delay, as you may imagine, is usually to ask the kernel to do it for you. There are two ways of setting up jiffy- based timeouts, depending on whether your driver is waiting for other events or not.
+
+If your driver uses a wait queue to wait for some other event, but you also want to be sure that it runs within a certain period of time, it can use wait_event_timeout or wait_event_interruptible_timeout:
+
+```c
+
+     #include <linux/wait.h>
+     long wait_event_timeout(wait_queue_head_t q, condition, long timeout);
+     long wait_event_interruptible_timeout(wait_queue_head_t q,
+                           condition, long timeout);
+```
+
+#### Short Delays
+
+When a device driver needs to deal with latencies in its hardware, the delays involved are usually a few dozen microseconds at most. In this case, relying on the clock tick is definitely not the way to go.
+The kernel functions ndelay, udelay, and mdelay serve well for short delays, delaying execution for the specified number of nanoseconds, microseconds, or milliseconds respectively.\* Their prototypes are:
+
+```c
+
+     #include <linux/delay.h>
+     void ndelay(unsigned long nsecs);
+     void udelay(unsigned long usecs);
+     void mdelay(unsigned long msecs);
+```
+
+It’s important to remember that the three delay functions are busy-waiting; other tasks can’t be run during the time lapse. Thus, they replicate, though on a different scale, the behavior of jitbusy. Thus, these functions should only be used when there is no practical alternative.
+
+There is another way of achieving millisecond (and longer) delays that does not involve busy waiting. The file <linux/delay.h> declares these functions:
+
+```c
+     void msleep(unsigned int millisecs);
+     unsigned long msleep_interruptible(unsigned int millisecs);
+     void ssleep(unsigned int seconds)
+```
+
+In general, if you can tolerate longer delays than requested, you should use schedule_timeout, msleep, or ssleep.
+
+### Kernel Timers
+
+Whenever you need to schedule an action to happen later, without blocking the current process until that time arrives, kernel timers are the tool for you. These timers are used to schedule execution of a function at a particular time in the future, based on the clock tick, and can be used for a variety of tasks; for example, polling a device by checking its state at regular intervals when the hardware can’t fire interrupts. Other typical uses of kernel timers are turning off the floppy motor or finishing another lengthy shut down operation. In such cases, delaying the return from close would impose an unnecessary (and surprising) cost on the application program. Finally, the kernel itself uses the timers in several situations, including the implementation of schedule_timeout.
+
+This asynchronous execution resembles what happens when a hardware interrupt happens (which is discussed in detail in Chapter 10). In fact, kernel timers are run as the result of a “software interrupt.” When running in this sort of atomic context, your code is subject to a number of constraints. Timer functions must be atomic in all the ways we discussed in the section “Spinlocks and Atomic Context” in Chapter 5, but there are some additional issues brought about by the lack of a pro- cess context. We will introduce these constraints now; they will be seen again in sev- eral places in later chapters. Repetition is called for because the rules for atomic contexts must be followed assiduously, or the system will find itself in deep trouble.
+
+A number of actions require the context of a process in order to be executed. When you are outside of process context (i.e., in interrupt context), you must observe the following rules:
+
+- No access to user space is allowed. Because there is no process context, there is no path to the user space associated with any particular process.
+- The current pointer is not meaningful in atomic mode and cannot be used since the relevant code has no connection with the process that has been interrupted.
+- No sleeping or scheduling may be performed. Atomic code may not call schedule or a form of wait_event, nor may it call any other function that could sleep. For example, calling kmalloc(..., GFP_KERNEL) is against the rules. Sema- phores also must not be used since they can sleep.
+
+#### The Timer API
+
+The kernel provides drivers with a number of functions to declare, register, and remove kernel timers. The following excerpt shows the basic building blocks:
+
+```c
+ #include <linux/timer.h>
+     struct timer_list {
+             /* ... */
+             unsigned long expires;
+             void (*function)(unsigned long);
+             unsigned long data;
+};
+     void init_timer(struct timer_list *timer);
+     struct timer_list TIMER_INITIALIZER(_function, _expires, _data);
+     void add_timer(struct timer_list * timer);
+     int del_timer(struct timer_list * timer);
+
+```
+
+#### The Implementation of Kernel Timers
+
+The implementation of the timers has been designed to meet the following requirements and assumptions:
+
+- Timer management must be as lightweight as possible.
+- The design should scale well as the number of active timers increases.
+- Most timers expire within a few seconds or minutes at most, while timers with long delays are pretty rare.
+- A timer should run on the same CPU that registered it.
+
+### Tasklets
+
+Another kernel facility related to timing issues is the tasklet mechanism. It is mostly used in interrupt management.
+
+Tasklets resemble kernel timers in some ways. They are always run at interrupt time, they always run on the same CPU that schedules them, and they receive an unsigned long argument. Unlike kernel timers, however, **you can’t ask to execute the function at a specific time. By scheduling a tasklet, you simply ask for it to be executed at a later time chosen by the kernel**. This behavior is especially useful with interrupt han- dlers, where the hardware interrupt must be managed as quickly as possible, but most of the data management can be safely delayed to a later time. Actually, a tasklet, just like a kernel timer, is executed (in atomic mode) in the context of a “soft interrupt,” a kernel mechanism that executes asynchronous tasks with hardware interrupts enabled.
+
+### Workqueues
+
+Workqueues are, superficially, similar to tasklets; they allow kernel code to request that a function be called at some future time. There are, however, some significant differences between the two, including:
+
+- Tasklets run in software interrupt context with the result that all tasklet code must be atomic. Instead, workqueue functions run in the context of a special kernel process; as a result, they have more flexibility. In particular, workqueue functions can sleep.
+- Tasklets always run on the processor from which they were originally submitted. Workqueues work in the same way, by default.
+- Kernel code can request that the execution of workqueue functions be delayed for an explicit interval.
+
+The key difference between the two is that tasklets execute quickly, for a short period of time, and in atomic mode, while workqueue functions may have higher latency but need not be atomic. Each mechanism has situations where it is appropriate.
+
+#### The Shared Queue
+
+A device driver, in many cases, does not need its own workqueue. If you only submit tasks to the queue occasionally, it may be more efficient to simply use the shared, default workqueue that is provided by the kernel. If you use this queue, however, you must be aware that you will be sharing it with others. Among other things, that means that you should not monopolize the queue for long periods of time (no long sleeps), and it may take longer for your tasks to get their turn in the processor.
+
+## Allocating Memory
+
+Thus far, we have used **kmalloc and kfree for the allocation and freeing of memory**. The Linux kernel offers a richer set of memory allocation primitives, however. In this chapter, we look at other ways of using memory in device drivers and how to optimize your system’s memory resources.
+
+### The Real Story of kmalloc
+
+The kmalloc allocation engine is a powerful tool and easily learned because of its similarity to malloc. The function is fast (unless it blocks) and doesn’t clear the mem- ory it obtains; the allocated region still holds its previous content.\* The allocated region is also contiguous in physical memory. In the next few sections, we talk in detail about kmalloc, so you can compare it with the memory allocation techniques that we discuss later.
+
+#### The Flags Argument
+
+Remember that the prototype for kmalloc is:
+
+```c
+#include <linux/slab.h>
+     void *kmalloc(size_t size, int flags);
+```
+
+##### Memory zones
+
+The Linux kernel knows about a minimum of three memory zones: DMA-capable memory, normal memory, and high memory. While allocation normally happens in the normal zone, setting either of the bits just mentioned requires memory to be allo- cated from a different zone. The idea is that every computer platform that must know about special memory ranges (instead of considering all RAM equivalents) will fall into this abstraction.
+
+#### The Size Argument
+
+The kernel manages the system’s physical memory, which is available only in page- sized chunks. As a result, kmalloc looks rather different from a typical user-space malloc implementation. A simple, heap-oriented allocation technique would quickly run into trouble; it would have a hard time working around the page boundaries. Thus, the kernel uses a special page-oriented allocation technique to get the best use from the system’s RAM.
+
+Linux handles memory allocation by creating a set of pools of memory objects of fixed sizes. Allocation requests are handled by going to a pool that holds sufficiently large objects and handing an entire memory chunk back to the requester. The mem- ory management scheme is quite complex, and the details of it are not normally all that interesting to device driver writers.
+
+### Lookaside Caches
+
+A device driver often ends up allocating many objects of the same size, over and over. Given that the kernel already maintains a set of memory pools of objects that are all the same size, why not add some special pools for these high-volume objects? In fact, the kernel does implement a facility to create this sort of pool, which is often called a lookaside cache. Device drivers normally do not exhibit the sort of memory behavior that justifies using a lookaside cache, but there can be exceptions; the USB and SCSI drivers in Linux 2.6 use caches.
+
+The cache manager in the Linux kernel is sometimes called the “slab allocator.” For that reason, its functions and types are declared in <linux/slab.h>. The slab allocator implements caches that have a type of kmem_cache_t; they are created with a call to kmem_cache_create:
+
+```c
+kmem_cache_t *kmem_cache_create(const char *name, size_t size,
+                               size_t offset,
+                               unsigned long flags,
+                               void (*constructor)(void *, kmem_cache_t *,
+                                                   unsigned long flags),
+                               void (*destructor)(void *, kmem_cache_t *,
+                                                  unsigned long flags));
+```
+
+#### A scull Based on the Slab Caches: scullc
+
+Time for an example. scullc is a cut-down version of the scull module that imple- ments only the bare device—the persistent memory region. Unlike scull, which uses kmalloc, scullc uses memory caches. The size of the quantum can be modified at compile time and at load time, but not at runtime—that would require creating a new memory cache, and we didn’t want to deal with these unneeded details.
+
+#### Memory Pools
+
+There are places in the kernel where memory allocations cannot be allowed to fail. As a way of guaranteeing allocations in those situations, the kernel developers created an abstraction known as a memory pool (or “mempool”). A memory pool is really just a form of a lookaside cache that tries to always keep a list of free memory around for use in emergencies.
+
+### get_free_page and Friends
+
+If a module needs to **allocate big chunks of memory**, it is usually better to use a page- oriented technique.
+
+To allocate pages, the following functions are available:
+get_zeroed_page(unsigned int flags);
+Returns a pointer to a new page and fills the page with zeros.
+**get_free_page(unsigned int flags);
+Similar to get_zeroed_page, but doesn’t clear the page.
+**get_free_pages(unsigned int flags, unsigned int order);
+Allocates and returns a pointer to the first byte of a memory area that is poten- tially several (physically contiguous) pages long but doesn’t zero the area.
+
+#### A scull Using Whole Pages: scullp
+
+In order to test page allocation for real, we have released the scullp module together with other sample code. It is a reduced scull, just like scullc introduced earlier.
+Memory quanta allocated by scullp are whole pages or page sets: the scullp_order variable defaults to 0 but can be changed at either compile or load time.
+The following lines show how it allocates memory:
+
+```c
+/* Here's the allocation of a single quantum */
+if (!dptr->data[s_pos]) {
+    dptr->data[s_pos] =
+    (void *)__get_free_pages(GFP_KERNEL, dptr->order);
+            if (!dptr->data[s_pos])
+                goto nomem;
+            memset(dptr->data[s_pos], 0, PAGE_SIZE << dptr->order);
+        }
+```
+
+The code to deallocate memory in scullp looks like this:
+
+```c
+/* This code frees a whole quantum-set */
+for (i = 0; i < qset; i++)
+   if (dptr->data[i])
+       free_pages((unsigned long)(dptr->data[i]),
+               dptr->order);
+```
+
+The main advantage of page-level allocation isn’t actually speed, but rather more efficient memory usage. Allocating by pages wastes no memory, whereas using kmalloc wastes an unpredictable amount of memory because of allocation granularity.
+
+But the biggest advantage of the \_\_get_free_page functions is that the pages obtained are completely yours, and you could, in theory, assemble the pages into a linear area by appropriate tweaking of the page tables. For example, you can allow a user pro- cess to mmap memory areas obtained as single unrelated pages.
+
+#### The alloc_pages Interface
+
+For now, suffice it to say that struct page is an internal kernel structure that describes a page of memory. As we will see, there are many places in the kernel where it is necessary to work with page structures; they are especially useful in any situation where you might be deal- ing with high memory, which does not have a constant address in kernel space.
+
+The real core of the Linux page allocator is a function called
+alloc_pages_node:
+
+```c
+ struct page *alloc_pages_node(int nid, unsigned int flags,
+                                   unsigned int order);
+```
+
+### vmalloc and Friends
+
+The next memory allocation function that we show you is vmalloc, which allocates a contiguous memory region in the virtual address space. Although the pages are not con- secutive in physical memory (each page is retrieved with a separate call to alloc_page), the kernel sees them as a contiguous range of addresses. vmalloc returns 0 (the NULL address) if an error occurs, otherwise, it returns a pointer to a linear memory area of size at least size.
+
+### Per-CPU Variables
+
+When you create a per-CPU variable, each processor on the system gets its own copy of that variable. This may seem like a strange thing to want to do, but it has its advantages. Access to per-CPU variables requires (almost) no locking, because each processor works with its own copy. Per-CPU variables can also remain in their respective processors’ caches, which leads to significantly better performance for frequently updated quantities.
+
+A good example of per-CPU variable use can be found in the networking subsystem. The kernel maintains no end of counters tracking how many of each type of packet was received; these counters can be updated thousands of times per second. Rather than deal with the caching and locking issues, the networking developers put the sta- tistics counters into per-CPU variables. Updates are now lockless and fast. On the rare occasion that user space requests to see the values of the counters, it is a simple matter to add up each processor’s version and return the total.
+
+### Obtaining Large Buffers
+
+#### Acquiring a Dedicated Buffer at Boot Time
+
+If you really need a huge buffer of physically contiguous memory, the best approach is often to allocate it by requesting memory at boot time. Allocation at boot time is the only way to retrieve consecutive memory pages while bypassing the limits imposed by \_\_get_free_pages on the buffer size, both in terms of maximum allowed size and limited choice of sizes. Allocating memory at boot time is a “dirty” tech- nique, because it bypasses all memory management policies by reserving a private memory pool. This technique is inelegant and inflexible, but it is also the least prone to failure. Needless to say, a module can’t allocate memory at boot time; only driv- ers directly linked to the kernel can do that.
+
+## Communicating with Hardware
+
+### I/O Ports and I/O Memory
+
+> In Linux and many other operating systems, I/O ports and I/O memory (often referred to as memory-mapped I/O or MMIO) are mechanisms that the CPU and OS use to communicate with peripherals and other hardware devices. Both methods provide interfaces to access hardware registers, but they use different address spaces and instructions.
+>
+>I/O Ports:
+>
+>This is a method for CPUs and devices to communicate using dedicated I/O address space, distinct from the main memory address space.
+I/O ports are accessed using special CPU instructions like IN and OUT (on x86 architectures).
+In Linux, /dev/port represents the I/O ports, but direct access is typically restricted for safety reasons. You'd use functions like inb(), outb(), inw(), outw(), etc., in kernel space to access I/O ports.
+>
+>I/O Memory (MMIO):
+>
+>In MMIO, the device registers are mapped into the same address space as the main memory. Accessing a memory address in this region communicates with a device instead of reading or writing to RAM.
+MMIO is accessed using regular load/store CPU instructions, but the addresses point to device registers instead of actual memory.
+In Linux kernel development, you'd use functions like ioread32(), iowrite32(), and so on to read from or write to MMIO regions. Also, before accessing MMIO, you'd use functions like ioremap() to map device memory into kernel space.
+
+Every peripheral device is controlled by writing and reading its registers. Most of the time a device has several registers, and they are accessed at consecutive addresses, either in the memory address space or in the I/O address space.
+
+While some CPU manufacturers implement a single address space in their chips, oth- ers decided that peripheral devices are different from memory and, therefore, deserve a separate address space.
+
+Linux implements the concept of I/O ports on all computer platforms it runs on, even on platforms where the CPU implements a single address space. The implementation of port access sometimes depends on the specific make and model of the host computer (because different models use different chipsets to map bus transactions into memory address space).
+
+#### I/O Registers and Conventional Memory
+
+The main difference between I/O registers and RAM is that I/O operations have **side effects**, while memory operations have none: the only effect of a memory write is storing a value to a location, and a memory read returns the last value written there. Because memory access speed is so critical to CPU performance, the no-side-effects case has been optimized in several ways: values are cached and read/write instruc- tions are reordered.
+
+### Using I/O Ports
+
+I/O ports are the means by which drivers communicate with many devices, at least part of the time. This section covers the various functions available for making use of I/O ports; we also touch on some portability issues.
+
+#### I/O Port Allocation
+
+The kernel provides a registration interface that allows your driver to claim the ports it needs. The core function in that interface is request_region:
+
+```c
+#include <linux/ioport.h>
+struct resource *request_region(unsigned long first, unsigned long n,
+                               const char *name);
+void release_region(unsigned long start, unsigned long n);
+int check_region(unsigned long first, unsigned long n);
+```
+
+#### Manipulating I/O ports
+
+After a driver has requested the range of I/O ports it needs to use in its activities, it must read and/or write to those ports. To this end, most hardware differentiates between 8-bit, 16-bit, and 32-bit ports. Usually you can’t mix them like you nor- mally do with system memory access.\*
+A C program, therefore, must call different functions to access different size ports. As suggested in the previous section, computer architectures that support only memory- mapped I/O registers fake port I/O by remapping port addresses to memory addresses, and the kernel hides the details from the driver in order to ease portabil- ity. The Linux kernel headers (specifically, the architecture-dependent header <asm/ io.h>) define the following inline functions to access I/O ports:
+
+```c
+unsigned inb(unsigned port);
+void outb(unsigned char byte, unsigned port);
+```
+
+Read or write byte ports (eight bits wide). The port argument is defined as unsigned long for some platforms and unsigned short for others. The return type of inb is also different across architectures.
+
+```c
+unsigned inw(unsigned port);
+void outw(unsigned short word, unsigned port);
+```
+
+These functions access 16-bit ports (one word wide); they are not available when compiling for the S390 platform, which supports only byte I/O.
+
+```c
+unsigned inl(unsigned port);
+void outl(unsigned longword, unsigned port);
+```
+
+These functions access 32-bit ports. longword is declared as either unsigned long or unsigned int, according to the platform. Like word I/O, “long” I/O is not available on S390.
+
+#### I/O Port Access from User Space
+
+The functions just described are primarily meant to be used by device drivers, but they can also be used from user space, at least on PC-class computers. The GNU C library defines them in <sys/io.h>. The following conditions should apply in order for inb and friends to be used in user-space code:
+
+- The program must be compiled with the -O option to force expansion of inline functions.
+- The ioperm or iopl system calls must be used to get permission to perform I/O operations on ports. ioperm gets permission for individual ports, while iopl gets permission for the entire I/O space. Both of these functions are x86-specific.
+- The program must run as root to invoke ioperm or iopl.\* Alternatively, one of its ancestors must have gained port access running as root.
+
+#### String Operations
+
+In addition to the single-shot in and out operations, some processors implement spe- cial instructions to transfer a sequence of bytes, words, or longs to and from a single I/O port of the same size. These are the so-called string instructions, and they per- form the task more quickly than a C-language loop can do. The following macros implement the concept of string I/O either by using a single machine instruction or by executing a tight loop if the target processor has no instruction that performs string I/O.
+
+The prototypes for string functions are:
+
+```c
+void insb(unsigned port, void *addr, unsigned long count);
+void outsb(unsigned port, void *addr, unsigned long count);
+```
+
+Read or write count bytes starting at the memory address addr.
+Data is read from or written to the single port port.
+
+```c
+void insw(unsigned port, void *addr, unsigned long count);
+void outsw(unsigned port, void *addr, unsigned long count);
+```
+
+Read or write 16-bit values to a single 16-bit port.
+
+```c
+void insl(unsigned port, void *addr, unsigned long count);
+void outsl(unsigned port, void *addr, unsigned long count);
+```
+
+Read or write 32-bit values to a single 32-bit port.
+
+There is one thing to keep in mind when using the string functions: they move a straight byte stream to or from the port. When the port and the host system have dif- ferent byte ordering rules, the results can be surprising. Reading a port with inw swaps the bytes, if need be, to make the value read match the host ordering. The string functions, instead, do not perform this swapping.
+
+#### Pausing I/O
+
+If your device misses some data, or if you fear it might miss some, you can use paus- ing functions in place of the normal ones.
+
+#### Platform Dependencies
+
+I/O instructions are, by their nature, highly processor dependent. Because they work with the details of how the processor handles moving data in and out, it is very hard to hide the differences between systems. As a consequence, much of the source code related to port I/O is platform-dependent.
+
+### An I/O Port Example
+
+A digital I/O port, in its most common incarnation, is a byte-wide I/O location, either memory-mapped or port-mapped. When you write a value to an output loca- tion, the electrical signal seen on output pins is changed according to the individual bits being written. When you read a value from the input location, the current logic level seen on input pins is returned as individual bit values.
+
+#### An Overview of the Parallel Port
+
+The parallel interface, in its minimal configuration (we overlook the ECP and EPP modes) is made up of **three 8-bit ports**. The PC standard starts the I/O ports for the first parallel interface at 0x378 and for the second at 0x278. The first port is a **bidirectional data register**; it connects directly to pins 2–9 on the physical connector. The second port is a **read-only status register**; when the parallel port is being used for a printer, this register reports several aspects of printer status, such as being online, out of paper, or busy. The third port is an **output-only control register**, which, among other things, controls whether interrupts are enabled.
+
+#### A Sample Driver
+
+The driver we introduce is called short (Simple Hardware Operations and Raw Tests). All it does is read and write a few 8-bit ports, starting from the one you select at load time. By default, it uses the port range assigned to the parallel interface of the PC. Each device node (with a unique minor number) accesses a different port. The short driver doesn’t do anything useful; it just isolates for external use as a single instruction acting on a port. If you are not used to port I/O, you can use short to get familiar with it; you can measure the time it takes to transfer data through a port or play other games.
+
+### Using I/O Memory
+
+Despite the popularity of I/O ports in the x86 world, the main mechanism used to communicate with devices is through memory-mapped registers and device mem- ory. Both are called I/O memory because the difference between registers and mem- ory is transparent to software.
+
+#### I/O Memory Allocation and Mapping
+
+I/O memory regions must be allocated prior to use. The interface for allocation of memory regions (defined in <linux/ioport.h>) is:
+
+```c
+struct resource *request_mem_region(unsigned long start, unsigned long len,
+                                   char *name);
+```
+
+#### Accessing I/O Memory
+
+On some platforms, you may get away with using the return value from ioremap as a pointer. Such use is not portable, and, increasingly, the kernel developers have been working to eliminate any such use. The proper way of getting at I/O memory is via a set of functions (defined via <asm/io.h>) provided for that purpose.
+To read from I/O memory, use one of the following:
+
+```c
+     unsigned int ioread8(void *addr);
+     unsigned int ioread16(void *addr);
+     unsigned int ioread32(void *addr);
+```
+
+Here, addr should be an address obtained from ioremap (perhaps with an integer off- set); the return value is what was read from the given I/O memory.
+
+There is a similar set of functions for writing to I/O memory:
+
+```c
+     void iowrite8(u8 value, void *addr);
+     void iowrite16(u16 value, void *addr);
+     void iowrite32(u32 value, void *addr);
+```
+
+If you must read or write a series of values to a given I/O memory address, you can use the repeating versions of the functions:
+
+```c
+     void ioread8_rep(void *addr, void *buf, unsigned long count);
+     void ioread16_rep(void *addr, void *buf, unsigned long count);
+     void ioread32_rep(void *addr, void *buf, unsigned long count);
+     void iowrite8_rep(void *addr, const void *buf, unsigned long count);
+     void iowrite16_rep(void *addr, const void *buf, unsigned long count);
+     void iowrite32_rep(void *addr, const void *buf, unsigned long count);
+```
+
+The ioread functions read count values from the given addr to the given buf, while the iowrite functions write count values from the given buf to the given addr. Note that count is expressed in the size of the data being written; ioread32_rep reads count 32- bit values starting at buf.
+The functions described above all perform I/O to the given addr. If, instead, you need to operate on a block of I/O memory, you can use one of the following:
+
+```c
+     void memset_io(void *addr, u8 value, unsigned int count);
+     void memcpy_fromio(void *dest, void *source, unsigned int count);
+     void memcpy_toio(void *dest, void *source, unsigned int count);
+```
+
+These functions behave like their C library analogs.
+If you read through the kernel source, you see many calls to an older set of functions when I/O memory is being used. These functions still work, but their use in new code is discouraged. Among other things, they are less safe because they do not per- form the same sort of type checking. Nonetheless, we describe them here:
+
+```c
+unsigned readb(address);
+unsigned readw(address);
+unsigned readl(address);
+```
+
+These macros are used to retrieve 8-bit, 16-bit, and 32-bit data values from I/O memory.
+
+```c
+void writeb(unsigned value, address);
+void writew(unsigned value, address);
+void writel(unsigned value, address);
+```
+
+Like the previous functions, these functions (macros) are used to write 8-bit, 16- bit, and 32-bit data items.
+Some 64-bit platforms also offer readq and writeq, for quad-word (8-byte) memory operations on the PCI bus. The quad-word nomenclature is a historical leftover from the times when all real processors had 16-bit words. Actually, the L naming used for 32-bit values has become incorrect too, but renaming everything would confuse things even more.
+
+#### Ports as I/O Memory
+
+Some hardware has an interesting feature: some versions use I/O ports, while others use I/O memory. The registers exported to the processor are the same in either case, but the access method is different. As a way of making life easier for drivers dealing with this kind of hardware, and as a way of minimizing the apparent differences between I/O port and memory accesses, the 2.6 kernel provides a function called ioport_map:
+```c
+void *ioport_map(unsigned long port, unsigned int count);
+```
+
+## Interrupt Handling
+
+An interrupt is simply a signal that the hardware can send when it wants the processor’s attention. Linux handles interrupts in much the same way that it handles signals in user space. For the most part, a driver need only register a handler for its device’s interrupts, and handle them properly when they arrive. Of course, underneath that simple picture there is some complexity; in particular, interrupt handlers are somewhat limited in the actions they can perform as a result of how they are run.
+
+### Installing an Interrupt Handler
+
+Interrupt lines are a precious and often limited resource, particularly when there are only 15 or 16 of them. The kernel keeps a registry of interrupt lines, similar to the registry of I/O ports. A module is expected to request an interrupt channel (or IRQ, for interrupt request) before using it and to release it when finished. In many situa- tions, modules are also expected to be able to share interrupt lines with other driv- ers, as we will see. The following functions, declared in <linux/interrupt.h>, implement the interrupt registration interface:
+
+```c
+
+int request_irq(unsigned int irq,
+                irqreturn_t (*handler)(int, void *, struct pt_regs *),
+                unsigned long flags,
+                const char *dev_name,
+                void *dev_id);
+void free_irq(unsigned int irq, void *dev_id);
+```
+
+The correct place to call request_irq is when the device is first opened, before the hardware is instructed to generate interrupts. The place to call free_irq is the last time the device is closed, after the hardware is told not to interrupt the processor any more. The disadvantage of this technique is that you need to keep a per-device open count so that you know when interrupts can be disabled.
+
+### The /proc Interface
+
+Whenever a hardware interrupt reaches the processor, an internal counter is incre- mented, providing a way to check whether the device is working as expected. Reported interrupts are shown in /proc/interrupts.
+
+### Autodetecting the IRQ Number
+
+One of the most challenging problems for a driver at initialization time can be how to determine which IRQ line is going to be used by the device. The driver needs the information in order to correctly install the handler.
+
+#### Kernel-assisted probing
+
+The Linux kernel offers a low-level facility for probing the interrupt number. It works for only nonshared interrupts, but most hardware that is capable of working in a shared interrupt mode provides better ways of finding the configured interrupt num- ber anyway. The facility consists of two functions, declared in <linux/interrupt.h> (which also describes the probing machinery):
+unsigned long probe_irq_on(void);
+This function returns a bit mask of unassigned interrupts. The driver must pre- serve the returned bit mask, and pass it to probe_irq_off later. After this call, the driver should arrange for its device to generate at least one interrupt.
+int probe_irq_off(unsigned long);
+After the device has requested an interrupt, the driver calls this function, passing as its argument the bit mask previously returned by probe_irq_on. probe_irq_off returns the number of the interrupt that was issued after “probe_on.” If no inter- rupts occurred, 0 is returned (therefore, IRQ 0 can’t be probed for, but no cus- tom device can use it on any of the supported architectures anyway). If more than one interrupt occurred (ambiguous detection), probe_irq_off returns a negative value.
+
+#### Do-it-yourself probing
+### Fast and Slow Handlers
+Older versions of the Linux kernel took great pains to distinguish between “fast” and “slow” interrupts. Fast interrupts were those that could be handled very quickly, whereas handling slow interrupts took significantly longer. Slow interrupts could be sufficiently demanding of the processor, and it was worthwhile to reenable inter- rupts while they were being handled. Otherwise, tasks requiring quick attention could be delayed for too long.
+In modern kernels, most of the differences between fast and slow interrupts have dis- appeared. There remains only one: fast interrupts (those that were requested with the SA_INTERRUPT flag) are executed with all other interrupts disabled on the current processor. Note that other processors can still handle interrupts, although you will never see two processors handling the same IRQ at the same time.
+So, which type of interrupt should your driver use? On modern systems, SA_INTERRUPT is intended only for use in a few, specific situations such as timer interrupts. Unless you have a strong reason to run your interrupt handler with other interrupts disabled, you should not use SA_INTERRUPT.
+This description should satisfy most readers, although someone with a taste for hard- ware and some experience with her computer might be interested in going deeper. If you don’t care about the internal details, you can skip to the next section.
+
+#### Implementing a Handler
+
+The only peculiarity is that a handler runs at interrupt time and, therefore, suffers some restrictions on what it can do. These restrictions are the same as those we saw with kernel timers. A handler can’t transfer data to or from user space, because it doesn’t execute in the context of a process. Handlers also cannot do anything that would sleep, such as calling wait_event, allocating memory with anything other than GFP_ATOMIC, or locking a semaphore. Finally, handlers cannot call schedule.
+
+## USB Drivers
