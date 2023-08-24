@@ -1564,7 +1564,7 @@ Workqueues are, superficially, similar to tasklets; they allow kernel code to re
 - Tasklets always run on the processor from which they were originally submitted. Workqueues work in the same way, by default.
 - Kernel code can request that the execution of workqueue functions be delayed for an explicit interval.
 
-The key difference between the two is that tasklets execute quickly, for a short period of time, and in atomic mode, while workqueue functions may have higher latency but need not be atomic. Each mechanism has situations where it is appropriate.
+The key difference between the two is that **tasklets execute quickly, for a short period of time, and in atomic mode, while workqueue functions may have higher latency but need not be atomic**. Each mechanism has situations where it is appropriate.
 
 #### The Shared Queue
 
@@ -1698,17 +1698,17 @@ If you really need a huge buffer of physically contiguous memory, the best appro
 
 > In Linux and many other operating systems, I/O ports and I/O memory (often referred to as memory-mapped I/O or MMIO) are mechanisms that the CPU and OS use to communicate with peripherals and other hardware devices. Both methods provide interfaces to access hardware registers, but they use different address spaces and instructions.
 >
->I/O Ports:
+> I/O Ports:
 >
->This is a method for CPUs and devices to communicate using dedicated I/O address space, distinct from the main memory address space.
-I/O ports are accessed using special CPU instructions like IN and OUT (on x86 architectures).
-In Linux, /dev/port represents the I/O ports, but direct access is typically restricted for safety reasons. You'd use functions like inb(), outb(), inw(), outw(), etc., in kernel space to access I/O ports.
+> This is a method for CPUs and devices to communicate using dedicated I/O address space, distinct from the main memory address space.
+> I/O ports are accessed using special CPU instructions like IN and OUT (on x86 architectures).
+> In Linux, /dev/port represents the I/O ports, but direct access is typically restricted for safety reasons. You'd use functions like inb(), outb(), inw(), outw(), etc., in kernel space to access I/O ports.
 >
->I/O Memory (MMIO):
+> I/O Memory (MMIO):
 >
->In MMIO, the device registers are mapped into the same address space as the main memory. Accessing a memory address in this region communicates with a device instead of reading or writing to RAM.
-MMIO is accessed using regular load/store CPU instructions, but the addresses point to device registers instead of actual memory.
-In Linux kernel development, you'd use functions like ioread32(), iowrite32(), and so on to read from or write to MMIO regions. Also, before accessing MMIO, you'd use functions like ioremap() to map device memory into kernel space.
+> In MMIO, the device registers are mapped into the same address space as the main memory. Accessing a memory address in this region communicates with a device instead of reading or writing to RAM.
+> MMIO is accessed using regular load/store CPU instructions, but the addresses point to device registers instead of actual memory.
+> In Linux kernel development, you'd use functions like ioread32(), iowrite32(), and so on to read from or write to MMIO regions. Also, before accessing MMIO, you'd use functions like ioremap() to map device memory into kernel space.
 
 Every peripheral device is controlled by writing and reading its registers. Most of the time a device has several registers, and they are accessed at consecutive addresses, either in the memory address space or in the I/O address space.
 
@@ -1897,6 +1897,7 @@ Some 64-bit platforms also offer readq and writeq, for quad-word (8-byte) memory
 #### Ports as I/O Memory
 
 Some hardware has an interesting feature: some versions use I/O ports, while others use I/O memory. The registers exported to the processor are the same in either case, but the access method is different. As a way of making life easier for drivers dealing with this kind of hardware, and as a way of minimizing the apparent differences between I/O port and memory accesses, the 2.6 kernel provides a function called ioport_map:
+
 ```c
 void *ioport_map(unsigned long port, unsigned int count);
 ```
@@ -1938,14 +1939,635 @@ int probe_irq_off(unsigned long);
 After the device has requested an interrupt, the driver calls this function, passing as its argument the bit mask previously returned by probe_irq_on. probe_irq_off returns the number of the interrupt that was issued after “probe_on.” If no inter- rupts occurred, 0 is returned (therefore, IRQ 0 can’t be probed for, but no cus- tom device can use it on any of the supported architectures anyway). If more than one interrupt occurred (ambiguous detection), probe_irq_off returns a negative value.
 
 #### Do-it-yourself probing
+
 ### Fast and Slow Handlers
+
 Older versions of the Linux kernel took great pains to distinguish between “fast” and “slow” interrupts. Fast interrupts were those that could be handled very quickly, whereas handling slow interrupts took significantly longer. Slow interrupts could be sufficiently demanding of the processor, and it was worthwhile to reenable inter- rupts while they were being handled. Otherwise, tasks requiring quick attention could be delayed for too long.
 In modern kernels, most of the differences between fast and slow interrupts have dis- appeared. There remains only one: fast interrupts (those that were requested with the SA_INTERRUPT flag) are executed with all other interrupts disabled on the current processor. Note that other processors can still handle interrupts, although you will never see two processors handling the same IRQ at the same time.
 So, which type of interrupt should your driver use? On modern systems, SA_INTERRUPT is intended only for use in a few, specific situations such as timer interrupts. Unless you have a strong reason to run your interrupt handler with other interrupts disabled, you should not use SA_INTERRUPT.
 This description should satisfy most readers, although someone with a taste for hard- ware and some experience with her computer might be interested in going deeper. If you don’t care about the internal details, you can skip to the next section.
 
-#### Implementing a Handler
+### Implementing a Handler
 
 The only peculiarity is that a handler runs at interrupt time and, therefore, suffers some restrictions on what it can do. These restrictions are the same as those we saw with kernel timers. A handler can’t transfer data to or from user space, because it doesn’t execute in the context of a process. Handlers also cannot do anything that would sleep, such as calling wait_event, allocating memory with anything other than GFP_ATOMIC, or locking a semaphore. Finally, handlers cannot call schedule.
 
-## USB Drivers
+A typical task for an interrupt handler is awakening processes sleeping on the device if the interrupt signals the event they’re waiting for, such as the arrival of new data.
+
+#### Handler Arguments and Return Value
+
+The interrupt number (int irq) is useful as information you may print in your log messages, if any. The second argument, void _dev_id, is a sort of client data; a void _ argument is passed to request_irq, and this same pointer is then passed back as an argument to the handler when the interrupt happens. You usually pass a pointer to your device data structure in dev_id, so a driver that manages several instances of the same device doesn’t need any extra code in the interrupt handler to find out which device is in charge of the current interrupt event.
+
+### Enabling and Disabling Interrupts
+
+There are ways of disabling interrupts that do not involve spinlocks. But before we discuss them, note that disabling interrupts should be a relatively rare activity, even in device drivers, and this technique should never be used as a mutual exclusion mechanism within a driver.
+
+#### Disabling a single interrupt
+
+```c
+     void disable_irq(int irq);
+     void disable_irq_nosync(int irq);
+     void enable_irq(int irq);
+```
+
+But why disable an interrupt? Sticking to the parallel port, let’s look at the plip net- work interface. A plip device uses the bare-bones parallel port to transfer data. Since only five bits can be read from the parallel connector, they are interpreted as four data bits and a clock/handshake signal. When the first four bits of a packet are trans- mitted by the initiator (the interface sending the packet), the clock line is raised, causing the receiving interface to interrupt the processor. The plip handler is then invoked to deal with newly arrived data.
+After the device has been alerted, the data transfer proceeds, using the handshake line to clock new data to the receiving interface (this might not be the best implementa- tion, but it is necessary for compatibility with other packet drivers using the parallel port). Performance would be unbearable if the receiving interface had to handle two interrupts for every byte received. Therefore, the driver disables the interrupt during the reception of the packet; instead, a poll-and-delay loop is used to bring in the data.
+Similarly, because the handshake line from the receiver to the transmitter is used to acknowledge data reception, the transmitting interface disables its IRQ line during packet transmission.
+
+#### Disabling all interrupts
+
+```c
+
+     void local_irq_save(unsigned long flags);
+     void local_irq_disable(void);
+
+```
+
+Turning interrupts back on is accomplished with:
+
+```c
+     void local_irq_restore(unsigned long flags);
+     void local_irq_enable(void);
+```
+
+### Top and Bottom Halves
+
+One of the main problems with interrupt handling is how to perform lengthy tasks within a handler. Often a substantial amount of work must be done in response to a device interrupt, but interrupt handlers need to finish up quickly and not keep inter- rupts blocked for long. These two needs (work and speed) conflict with each other, leaving the driver writer in a bit of a bind.
+
+Linux (along with many other systems) resolves this problem by splitting the inter- rupt handler into two halves. The so-called top half is the routine that actually responds to the interrupt—the one you register with request_irq. The bottom half is a routine that is scheduled by the top half to be executed later, at a safer time. The big difference between the top-half handler and the bottom half is that all interrupts are enabled during execution of the bottom half—that’s why it runs at a safer time. In the typical scenario, **the top half saves device data to a device-specific buffer, schedules its bottom half, and exits**: this operation is very fast. **The bottom half then performs whatever other work is required, such as awakening processes, starting up another I/O operation, and so on**. This setup permits the top half to service a new interrupt while the bottom half is still working.
+
+#### Tasklets
+
+Remember that tasklets are a special function that may be scheduled to run, in soft- ware interrupt context, at a system-determined safe time. They may be scheduled to run multiple times, but tasklet scheduling is not cumulative; the tasklet runs only once, even if it is requested repeatedly before it is launched. No tasklet ever runs in parallel with itself, since they run only once, but tasklets can run in parallel with other tasklets on SMP systems. Thus, if your driver has multiple tasklets, they must employ some sort of locking to avoid conflicting with each other.
+
+#### Workqueues
+
+Recall that workqueues invoke a function at some future time in the context of a spe- cial worker process. Since the workqueue function runs in process context, it can sleep if need be. You cannot, however, copy data into user space from a workqueue, unless you use the advanced techniques we demonstrate in Chapter 15; the worker process does not have access to any other process’s address space.
+
+### Interrupt Sharing
+
+Modern hardware, of course, has been designed to allow the sharing of interrupts; the PCI bus requires it. Therefore, the Linux kernel supports interrupt sharing on all buses, even those (such as the ISA bus) where sharing has traditionally not been sup- ported. Device drivers for the 2.6 kernel should be written to work with shared inter- rupts if the target hardware can support that mode of operation. Fortunately, working with shared interrupts is easy, most of the time.
+
+#### Installing a Shared Handler
+
+Shared interrupts are installed through request_irq just like nonshared ones, but there are two differences:
+
+- The SA_SHIRQ bit must be specified in the flags argument when requesting the interrupt.
+- The dev_id argument must be unique. Any pointer into the module’s address space will do, but dev_id definitely cannot be set to NULL.
+
+Whenever two or more drivers are sharing an interrupt line and the hardware inter- rupts the processor on that line, the kernel invokes every handler registered for that interrupt, passing each its own dev_id. Therefore, a shared handler must be able to recognize its own interrupts and should quickly exit when its own device has not interrupted. Be sure to return IRQ_NONE whenever your handler is called and finds that the device is not interrupting.
+
+#### The /proc Interface and Shared Interrupts
+
+Installing shared handlers in the system doesn’t affect /proc/stat, which doesn’t even know about handlers. However, /proc/interrupts changes slightly.
+
+### Interrupt-Driven I/O
+
+Whenever a data transfer to or from the managed hardware might be delayed for any reason, the driver writer should implement buffering. Data buffers help to detach data transmission and reception from the write and read system calls, and overall sys- tem performance benefits. A good buffering mechanism leads to interrupt-driven I/O, in which an input buffer is filled at interrupt time and is emptied by processes that read the device; an output buffer is filled by processes that write to the device and is emptied at interrupt time.
+
+For interrupt-driven data transfer to happen successfully, the hardware should be able to generate interrupts with the following semantics:
+
+- For input, the device interrupts the processor when new data has arrived and is ready to be retrieved by the system processor. The actual actions to perform depend on whether the device uses I/O ports, memory mapping, or DMA.
+- For output, the device delivers an interrupt either when it is ready to accept new data or to acknowledge a successful data transfer. Memory-mapped and DMA- capable devices usually generate interrupts to tell the system they are done with the buffer.
+
+#### A Write-Buffering Example
+
+### Quick Reference
+
+These symbols related to interrupt management were introduced in this chapter:
+
+```c
+#include <linux/interrupt.h>
+int request_irq(unsigned int irq, irqreturn_t (*handler)(), unsigned long
+  flags, const char *dev_name, void *dev_id);
+void free_irq(unsigned int irq, void *dev_id);
+```
+
+Calls that register and unregister an interrupt handler.
+
+```c
+#include <linux/irq.h.h>
+int can_request_irq(unsigned int irq, unsigned long flags);
+```
+
+This function, available on the i386 and x86_64 architectures, returns a nonzero value if an attempt to allocate the given interrupt line succeeds.
+
+```c
+#include <asm/signal.h>
+SA_INTERRUPT
+SA_SHIRQ
+SA_SAMPLE_RANDOM
+```
+
+Flags for request_irq. SA_INTERRUPT requests installation of a fast handler (as opposed to a slow one). SA_SHIRQ installs a shared handler, and the third flag asserts that interrupt timestamps can be used to generate system entropy.
+
+```shell
+/proc/interrupts
+/proc/stat
+```
+
+Filesystem nodes that report information about hardware interrupts and installed handlers.
+
+```c
+unsigned long probe_irq_on(void);
+int probe_irq_off(unsigned long);
+```
+
+Functions used by the driver when it has to probe to determine which interrupt line is being used by a device. The result of probe*irq_on must be passed
+back to probe_irq_off after the interrupt has been generated. The return value of probe* irq_off is the detected interrupt number.
+
+```c
+IRQ_NONE
+IRQ_HANDLED
+IRQ_RETVAL(int x)
+```
+
+The possible return values from an interrupt handler, indicating whether an actual interrupt from the device was present.
+
+```c
+void disable_irq(int irq);
+void disable_irq_nosync(int irq);
+void enable_irq(int irq);
+```
+
+A driver can enable and disable interrupt reporting. If the hardware tries to gen- erate an interrupt while interrupts are disabled, the interrupt is lost forever. A driver using a shared handler must not use these functions.
+
+```c
+void local_irq_save(unsigned long flags);
+void local_irq_restore(unsigned long flags);
+```
+
+Use local_irq_save to disable interrupts on the local processor and remember their previous state. The flags can be passed to local_irq_restore to restore the previous interrupt state.
+
+```c
+void local_irq_disable(void);
+void local_irq_enable(void);
+```
+
+Functions that unconditionally disable and enable interrupts on the current processor.
+
+## Data Types in the Kernel
+
+Before we go on to more advanced topics, we need to stop for a quick note on porta- bility issues. Modern versions of the Linux kernel are highly portable, running on numerous different architectures. Given the multiplatform nature of Linux, drivers intended for serious use should be portable as well.
+
+Data types used by kernel data are divided into three main classes: standard C types such as int, explicitly sized types such as u32, and types used for specific kernel objects, such as pid_t.
+
+### Use of Standard C Types
+
+The program can be used to show that long integers and pointers feature a different size on 64-bit platforms, as demonstrated by running the program on different Linux computers:
+arch Size: char short int long ptr long-long u8 u16 u32 u64
+i386 1 2 4 4 4 8 1 2 4 8
+alpha 1 2 4 8 8 8 1 2 4 8
+armv4l 1 2 4 4 4 8 1 2 4 8
+ia64 1 2 4 8 8 8 1 2 4 8
+m68k 1 2 4 4 4 8 1 2 4 8
+mips 1 2 4 4 4 8 1 2 4 8
+ppc 1 2 4 4 4 8 1 2 4 8
+sparc 1 2 4 4 4 8 1 2 4 8
+sparc64 1 2 4 4 4 8 1 2 4 8
+x86_64 1 2 4 8 8 8 1 2 4 8
+
+### Assigning an Explicit Size to Data Items
+
+The kernel offers the following data types to use whenever you need to know the size of your data. All the types are declared in <asm/types.h>, which, in turn, is included by <linux/types.h>:
+
+```c
+     u8;   /* unsigned byte (8 bits) */
+     u16;  /* unsigned word (16 bits) */
+     u32;  /* unsigned 32-bit value */
+     u64;  /* unsigned 64-bit value */
+```
+
+It’s important to remember that these types are Linux specific, and using them hin- ders porting software to other Unix flavors. Systems with recent compilers support the C99-standard types, such as uint8_t and uint32_t; if portability is a concern, those types can be used in favor of the Linux-specific variety.
+
+### Interface-Specific Types
+
+Some of the commonly used data types in the kernel have their own typedef state- ments, thus preventing any portability problems. For example, a process identifier (pid) is usually pid_t instead of int. Using pid_t masks any possible difference in the actual data typing. We use the expression interface-specific to refer to a type defined by a library in order to provide an interface to a specific data structure.
+
+Whenever your driver uses functions that require such “custom” types and you don’t follow the convention, the compiler issues a warning; if you use the -Wall compiler flag and are careful to remove all the warnings, you can feel confident that your code is portable.
+
+### Other Portability Issues
+
+A general rule is to be suspicious of explicit constant values. Usually the code has been parameterized using preprocessor macros. This section lists the most impor- tant portability problems. Whenever you encounter other values that have been parameterized, you can find hints in the header files and in the device drivers distrib- uted with the official kernel.
+
+#### Time Intervals
+
+When dealing with time intervals, don’t assume that there are 1000 jiffies per second。
+More generally, the number of jiffies corresponding to msec milliseconds is always msec\*HZ/1000.
+
+#### Page Size
+
+When playing games with memory, remember that a memory page is PAGE_SIZE bytes, not 4 KB. Assuming that the page size is 4 KB and hardcoding the value is a common error among PC programmers, instead, supported platforms show page sizes from 4 KB to 64 KB, and sometimes they differ between different implementa- tions of the same platform.
+
+If a driver needs 16 KB for temporary data, it shouldn’t specify an order of 2 to get_free_pages. You need a portable solution. Such a solution, fortunately, has been written by the kernel developers and is called get_order:
+
+```c
+     #include <asm/page.h>
+     int order = get_order(16*1024);
+     buf = get_free_pages(GFP_KERNEL, order);
+```
+
+Remember that the argument to get_order must be a power of two.
+
+#### Byte Order
+
+Be careful not to make assumptions about byte ordering. Whereas the PC stores multibyte values low-byte first (little end first, thus little-endian), some high-level platforms work the other way (big-endian). Whenever possible, your code should be written such that it does not care about byte ordering in the data it manipulates. However, sometimes a driver needs to build an integer number out of single bytes or do the opposite, or it must communicate with a device that expects a specific order.
+
+The include file <asm/byteorder.h> defines either **BIG_ENDIAN or **LITTLE_ENDIAN, depending on the processor’s byte ordering. When dealing with byte ordering issues, you could code a bunch of #ifdef \_\_LITTLE_ENDIAN conditionals, but there is a bet- ter way. The Linux kernel defines a set of macros that handle conversions between the processor’s byte ordering and that of the data you need to store or load in a spe- cific byte order. For example:
+
+```c
+     u32 cpu_to_le32 (u32);
+     u32 le32_to_cpu (u32);
+```
+
+These two macros convert a value from whatever the CPU uses to an unsigned, little- endian, 32-bit quantity and back. They work whether your CPU is big-endian or lit- tle-endian and, for that matter, whether it is a 32-bit processor or not. They return their argument unchanged in cases where there is no work to be done. Use of these macros makes it easy to write portable code without having to use a lot of condi- tional compilation constructs.
+
+#### Data Alignment
+
+In order to write data structures for data items that can be moved across architec- tures, you should always enforce natural alignment of the data items in addition to standardizing on a specific endianness. Natural alignment means storing data items at an address that is a multiple of their size (for instance, 8-byte items go in an address multiple of 8). To enforce natural alignment while preventing the compiler to arrange the fields in unpredictable ways, you should use filler fields that avoid leaving holes in the data structure.
+
+#### Pointers and Error Values
+
+Many internal kernel functions return a pointer value to the caller. Many of those functions can also fail. In most cases, failure is indicated by returning a NULL pointer value. This technique works, but it is unable to communicate the exact nature of the problem. Some interfaces really need to return an actual error code so that the caller can make the right decision based on what actually went wrong.
+A number of kernel interfaces return this information by encoding the error code in a pointer value. Such functions must be used with care, since their return value cannot simply be compared against NULL. To help in the creation and use of this sort of inter- face, a small set of functions has been made available (in <linux/err.h>).
+A function returning a pointer type can return an error value with:
+
+```c
+void *ERR_PTR(long error);
+```
+
+where error is the usual negative error code. The caller can use IS_ERR to test
+whether a returned pointer is an error code or not:
+
+```c
+long IS_ERR(const void *ptr);
+```
+
+If you need the actual error code, it can be extracted with:
+
+```c
+long PTR_ERR(const void \*ptr);
+```
+
+You should use PTR_ERR only on a value for which IS_ERR returns a true value; any other value is a valid pointer.
+
+#### Linked Lists
+
+Operating system kernels, like many other programs, often need to maintain lists of data structures. The Linux kernel has, at times, been host to several linked list imple- mentations at the same time. To reduce the amount of duplicated code, the kernel developers have created a standard implementation of circular, doubly linked lists; others needing to manipulate lists are encouraged to use this facility.
+
+To use the list mechanism, your driver must include the file <linux/list.h>. This file defines a simple structure of type list_head:
+
+```c
+    struct list_head {
+        struct list_head *next, *prev;
+};
+```
+
+### Quick Reference
+
+The following symbols were introduced in this chapter:
+
+```c
+#include <linux/types.h>
+typedef u8;
+typedef u16;
+typedef u32;
+typedef u64;
+```
+
+Types guaranteed to be 8-, 16-, 32-, and 64-bit unsigned integer values. The equivalent signed types exist as well. In user space, you can refer to the types as **u8, **u16, and so forth.
+
+```c
+
+#include <asm/page.h>
+PAGE_SIZE
+PAGE_SHIFT
+```
+
+Symbols that define the number of bytes per page for the current architecture and the number of bits in the page offset (12 for 4-KB pages and 13 for 8-KB pages).
+
+```c
+#include <asm/byteorder.h> _ _LITTLE_ENDIAN
+_ _BIG_ENDIAN
+```
+
+Only one of the two symbols is defined, depending on the architecture.
+
+```c
+#include <asm/byteorder.h> u32 __cpu_to_le32 (u32); u32 __le32_to_cpu (u32);
+```
+
+Functions that convert between known byte orders and that of the processor. There are more than 60 such functions; see the various files in include/linux/ byteorder/ for a full list and the ways in which they are defined.
+
+```c
+#include <asm/unaligned.h>
+get_unaligned(ptr);
+put_unaligned(val, ptr);
+```
+
+Some architectures need to protect unaligned data access using these macros. The macros expand to normal pointer dereferencing for architectures that per- mit you to access unaligned data.
+
+```c
+#include <linux/err.h>
+void *ERR_PTR(long error);
+long PTR_ERR(const void *ptr);
+long IS_ERR(const void *ptr);
+```
+
+Functions allow error codes to be returned by functions that return a pointer value.
+
+```c
+#include <linux/list.h>
+list_add(struct list_head *new, struct list_head *head);
+list_add_tail(struct list_head *new, struct list_head *head);
+list_del(struct list_head *entry);
+list_del_init(struct list_head *entry);
+list_empty(struct list_head *head);
+list_entry(entry, type, member);
+list_move(struct list_head *entry, struct list_head *head);
+list_move_tail(struct list_head *entry, struct list_head *head);
+list_splice(struct list_head *list, struct list_head *head);
+```
+
+Functions that manipulate circular, doubly linked lists.
+
+```c
+list_for_each(struct list_head *cursor, struct list_head *list)
+list_for_each_prev(struct list_head *cursor, struct list_head *list)
+list_for_each_safe(struct list_head *cursor, struct list_head *next, struct
+  list_head *list)
+list_for_each_entry(type *cursor, struct list_head *list, member)
+list_for_each_entry_safe(type *cursor, type *next struct list_head *list,
+member)
+```
+
+Convenience macros for iterating through linked lists.
+
+## PCI Drivers
+
+A bus is made up of both an electrical interface and a programming interface.
+
+### The PCI Interface
+
+The PCI architecture was designed as a replacement for the ISA standard, with three main goals: to get better performance when transferring data between the computer and its peripherals, to be as platform independent as possible, and to simplify add- ing and removing peripherals to the system.
+
+#### PCI Addressing
+
+Each PCI domain can host up to 256 buses. Each bus hosts up to 32 devices, and each device can be a multifunction board (such as an audio device with an accompanying CD-ROM drive) with a maximum of eight functions. Therefore, each function can be identified at hardware level by a 16-bit address, or key. Device drivers written for Linux, though, don’t need to deal with those binary addresses, because they use a specific data structure, called **pci_dev**, to act on the devices.
+
+Most recent workstations feature at least two PCI buses. Plugging more than one bus in a single system is accomplished by means of bridges, special-purpose PCI peripher- als whose task is joining two buses. The overall layout of a PCI system is a tree where each bus is connected to an upper-layer bus, up to bus 0 at the root of the tree. The CardBus PC-card system is also connected to the PCI system via bridges.
+
+When the hardware address is displayed, it can be shown as two values (an 8-bit bus number and an 8-bit device and function number), as three values (bus, device, and function), or as four values (domain, bus, device, and function); all the values are usually displayed in hexadecimal.
+
+The hardware circuitry of each peripheral board answers queries pertaining to three address spaces: memory locations, I/O ports, and configuration registers. The first two address spaces are shared by all the devices on the same PCI bus (i.e., when you access a memory location, all the devices on that PCI bus see the bus cycle at the same time).
+
+The PCI configuration space consists of 256 bytes for each device function (except for PCI Express devices, which have 4 KB of configuration space for each function), and the layout of the configuration registers is standardized. Four bytes of the config- uration space hold a unique function ID, so the driver can identify its device by look- ing for the specific ID for that peripheral.† In summary, each device board is geographically addressed to retrieve its configuration registers; the information in those registers can then be used to perform normal I/O access, without the need for further geographic addressing.
+
+#### Boot Time
+
+At system boot, the firmware (or the Linux kernel, if so configured) performs config- uration transactions with every PCI peripheral in order to allocate a safe place for each address region it offers. By the time a device driver accesses the device, its mem- ory and I/O regions have already been mapped into the processor’s address space. The driver can change this default assignment, but it never needs to do that.
+
+#### Configuration Registers and Initialization
+
+All PCI devices feature at least a 256-byte address space. The first 64 bytes are standard- ized, while the rest are device dependent.
+
+It’s interesting to note that the PCI registers are always little-endian. Although the standard is designed to be architecture independent, the PCI designers sometimes show a slight bias toward the PC environment. The driver writer should be careful about byte ordering when accessing multibyte configuration registers; code that works on the PC might not work on other platforms.
+
+- vendorID
+
+This 16-bit register identifies a hardware manufacturer. For instance, every Intel device is marked with the same vendor number, 0x8086. There is a global regis- try of such numbers, maintained by the PCI Special Interest Group, and manu- facturers must apply to have a unique number assigned to them.
+
+- deviceID
+
+This is another 16-bit register, selected by the manufacturer; no official registra- tion is required for the device ID. This ID is usually paired with the vendor ID to make a unique 32-bit identifier for a hardware device. We use the word signa- ture to refer to the vendor and device ID pair. A device driver usually relies on the signature to identify its device; you can find what value to look for in the hardware manual for the target device.
+
+- class
+
+Every peripheral device belongs to a class. The class register is a 24-bit value whose top 8 bits identify the “base class” (or group). For example, “ethernet” and “token ring” are two classes belonging to the “network” group, while the “serial” and “parallel” classes belong to the “communication” group. Some driv- ers can support several similar devices, each of them featuring a different signa- ture but all belonging to the same class; these drivers can rely on the class register to identify their peripherals, as shown later.
+
+#### MODULE_DEVICE_TABLE
+
+This pci_device_id structure needs to be exported to user space to allow the hotplug and module loading systems know what module works with what hardware devices. The macro MODULE_DEVICE_TABLE accomplishes this. An example is:
+
+```c
+     MODULE_DEVICE_TABLE(pci, i810_ids);
+```
+
+##### Registering a PCI Driver
+
+The main structure that all PCI drivers must create in order to be registered with the kernel properly is the struct pci_driver structure. This structure consists of a num- ber of function callbacks and variables that describe the PCI driver to the PCI core. Here are the fields in this structure that a PCI driver needs to be aware of:
+
+```c
+const char *name;
+```
+
+The name of the driver. It must be unique among all PCI drivers in the kernel and is normally set to the same name as the module name of the driver. It shows up in sysfs under /sys/bus/pci/drivers/ when the driver is in the kernel.
+
+```c
+const struct pci_device_id *id_table;
+```
+
+Pointer to the struct pci_device_id table described earlier in this chapter.
+
+```c
+int (*probe) (struct pci_dev *dev, const struct pci_device_id *id);
+```
+
+Pointer to the probe function in the PCI driver. This function is called by the PCI core when it has a struct pci_dev that it thinks this driver wants to control. A pointer to the struct pci_device_id that the PCI core used to make this decision is also passed to this function. If the PCI driver claims the struct pci_dev that is passed to it, it should initialize the device properly and return 0. If the driver does not want to claim the device, or an error occurs, it should return a negative error value. More details about this function follow later in this chapter.
+
+```c
+void (*remove) (struct pci_dev *dev);
+```
+
+Pointer to the function that the PCI core calls when the struct pci_dev is being removed from the system, or when the PCI driver is being unloaded from the kernel. More details about this function follow later in this chapter.
+
+```c
+int (*suspend) (struct pci_dev *dev, u32 state);
+```
+
+Pointer to the function that the PCI core calls when the struct pci_dev is being suspended. The suspend state is passed in the state variable. This
+function is optional; a driver does not have to provide it.
+
+```c
+int (*resume) (struct pci_dev *dev);
+```
+
+Pointer to the function that the PCI core calls when the struct pci_dev is being resumed. It is always called after suspend has been called. This function is optional; a driver does not have to provide it.
+In summary, to create a proper struct pci_driver structure, only four fields need to be initialized:
+
+```c
+     static struct pci_driver pci_driver = {
+         .name = "pci_skel",
+         .id_table = ids,
+         .probe = probe,
+         .remove = remove,
+     };
+```
+
+#### Enabling the PCI Device
+
+In the probe function for the PCI driver, before the driver can access any device resource (I/O region or interrupt) of the PCI device, the driver must call the pci_enable_device function:
+
+```c
+ int pci_enable_device(struct pci_dev *dev);
+```
+
+This function actually enables the device. It wakes up the device and in some cases also assigns its interrupt line and I/O regions. This happens, for example, with CardBus devices (which have been made completely equivalent to PCI at the driver level).
+
+#### Accessing the Configuration Space
+
+After the driver has detected the device, it usually needs to read from or write to the three address spaces: memory, port, and configuration. In particular, accessing the configuration space is vital to the driver, because it is the only way it can find out where the device is mapped in memory and in the I/O space.
+
+Because the microprocessor has no way to access the configuration space directly, the computer vendor has to provide a way to do it. To access configuration space, the CPU must write and read registers in the PCI controller, but the exact implemen- tation is vendor dependent and not relevant to this discussion, because Linux offers a standard interface to access the configuration space.
+
+As far as the driver is concerned, the configuration space can be accessed through 8- bit, 16-bit, or 32-bit data transfers. The relevant functions are prototyped in <linux/ pci.h>:
+
+```c
+int pci_read_config_byte(struct pci_dev *dev, int where, u8 *val);
+int pci_read_config_word(struct pci_dev *dev, int where, u16 *val);
+int pci_read_config_dword(struct pci_dev *dev, int where, u32 *val);
+```
+
+Read one, two, or four bytes from the configuration space of the device identi- fied by dev. The where argument is the byte offset from the beginning of the con- figuration space. The value fetched from the configuration space is returned through the val pointer, and the return value of the functions is an error code. The word and dword functions convert the value just read from little-endian to the native byte order of the processor, so you need not deal with byte ordering.
+
+```c
+int pci_write_config_byte(struct pci_dev *dev, int where, u8 val);
+int pci_write_config_word(struct pci_dev *dev, int where, u16 val);
+int pci_write_config_dword(struct pci_dev *dev, int where, u32 val);
+```
+
+Write one, two, or four bytes to the configuration space. The device is identified by dev as usual, and the value being written is passed as val. The word and dword functions convert the value to little-endian before writing to the periph- eral device.
+All of the previous functions are implemented as inline functions that really call the following functions. Feel free to use these functions instead of the above in case the driver does not have access to a struct pci_dev at any paticular moment in time:
+
+```c
+int pci_bus_read_config_byte (struct pci_bus *bus, unsigned int devfn, int
+  where, u8 *val);
+int pci_bus_read_config_word (struct pci_bus *bus, unsigned int devfn, int
+  where, u16 *val);
+int pci_bus_read_config_dword (struct pci_bus *bus, unsigned int devfn, int
+  where, u32 *val);
+```
+
+Just like the pci*read* functions, but struct pci*bus * and devfn variables are needed instead of a struct pci*dev *.
+
+```c
+int pci_bus_write_config_byte (struct pci_bus *bus, unsigned int devfn, int
+  where, u8 val);
+int pci_bus_write_config_word (struct pci_bus *bus, unsigned int devfn, int
+  where, u16 val);
+int pci_bus_write_config_dword (struct pci_bus *bus, unsigned int devfn, int
+  where, u32 val);
+```
+
+Just like the pci*write* functions, but struct pci*bus * and devfn variables are needed instead of a struct pci*dev *.
+The best way to address the configuration variables using the pci*read* functions is by means of the symbolic names defined in <linux/pci.h>. For example, the follow- ing small function retrieves the revision ID of a device by passing the symbolic name for where to pci_read_config_byte:
+
+```c
+     static unsigned char skel_get_revision(struct pci_dev *dev)
+     {
+u8 revision;
+         pci_read_config_byte(dev, PCI_REVISION_ID, &revision);
+         return revision;
+     }
+```
+
+#### Accessing the I/O and Memory Spaces
+
+A PCI device implements up to six I/O address regions. Each region consists of either memory or I/O locations. Most devices implement their I/O registers in memory regions, because it’s generally a saner approach (as explained in the section “I/O Ports and I/O Memory,” in Chapter 9). However, unlike normal memory, I/O regis- ters should not be cached by the CPU because each access can have side effects. The PCI device that implements I/O registers as a memory region marks the difference by setting a “memory-is-prefetchable” bit in its configuration register.\* If the memory region is marked as prefetchable, the CPU can cache its contents and do all sorts of optimization with it; nonprefetchable memory access, on the other hand, can’t be optimized because each access can have side effects, just as with I/O ports. Peripher- als that map their control registers to a memory address range declare that range as nonprefetchable, whereas something like video memory on PCI boards is prefetch- able. In this section, we use the word region to refer to a generic I/O address space that is memory-mapped or port-mapped.
+
+#### PCI Interrupts
+
+As far as interrupts are concerned, PCI is easy to handle. By the time Linux boots, the computer’s firmware has already assigned a unique interrupt number to the device, and the driver just needs to use it. The interrupt number is stored in configu- ration register 60 (PCI_INTERRUPT_LINE), which is one byte wide. This allows for as many as 256 interrupt lines, but the actual limit depends on the CPU being used. The driver doesn’t need to bother checking the interrupt number, because the value found in PCI_INTERRUPT_LINE is guaranteed to be the right one.
+
+#### Hardware Abstractions
+
+The mechanism used to implement hardware abstraction is the usual structure con- taining methods. It’s a powerful technique that adds just the minimal overhead of dereferencing a pointer to the normal overhead of a function call. In the case of PCI management, the only hardware-dependent operations are the ones that read and write configuration registers, because everything else in the PCI world is accom- plished by directly reading and writing the I/O and memory address spaces, and those are under direct control of the CPU.
+Thus, the relevant structure for configuration register access includes only two fields:
+
+```c
+     struct pci_ops {
+         int (*read)(struct pci_bus *bus, unsigned int devfn, int where, int size,
+                     u32 *val);
+         int (*write)(struct pci_bus *bus, unsigned int devfn, int where, int size,
+u32 val);
+};
+```
+
+The structure is defined in <linux/pci.h> and used by drivers/pci/pci.c, where the actual public functions are defined.
+
+### Quick Reference
+
+This section summarizes the symbols introduced in the chapter:
+
+```c
+#include <linux/pci.h>
+```
+
+Header that includes symbolic names for the PCI registers and several vendor and device ID values.
+
+```c
+struct pci_dev;
+```
+
+Structure that represents a PCI device within the kernel.
+
+```c
+struct pci_driver;
+```
+
+Structure that represents a PCI driver. All PCI drivers must define this.
+
+```c
+struct pci_device_id;
+```
+
+Structure that describes the types of PCI devices this driver supports.
+
+```c
+int pci_register_driver(struct pci_driver *drv);
+int pci_module_init(struct pci_driver *drv);
+void pci_unregister_driver(struct pci_driver *drv);
+```
+
+Functions that register or unregister a PCI driver from the kernel.
+
+```c
+struct pci_dev *pci_find_device(unsigned int vendor, unsigned int device,
+                                struct pci_dev *from);
+struct pci_dev *pci_find_device_reverse(unsigned int vendor, unsigned int
+                                        device, const struct pci_dev *from);
+struct pci_dev *pci_find_subsys (unsigned int vendor, unsigned int device, unsigned int ss_vendor, unsigned int ss_device, const struct pci_dev *from);
+struct pci_dev *pci_find_class(unsigned int class, struct pci_dev *from);
+```
+
+Functions that search the device list for devices with a specific signature or those belonging to a specific class. The return value is NULL if none is found. from is used to continue a search; it must be NULL the first time you call either function, and it must point to the device just found if you are searching for more devices. These functions are not recommended to be used, use the pci*get* variants instead.
+
+```c
+struct pci_dev *pci_get_device(unsigned int vendor, unsigned int device,
+                               struct pci_dev *from);
+struct pci_dev *pci_get_subsys(unsigned int vendor, unsigned int device,
+  unsigned int ss_vendor, unsigned int ss_device, struct pci_dev *from);
+struct pci_dev *pci_get_slot(struct pci_bus *bus, unsigned int devfn);
+```
+
+Functions that search the device list for devices with a specific signature or belonging to a specific class. The return value is NULL if none is found. from is used to continue a search; it must be NULL the first time you call either function, and it must point to the device just found if you are searching for more devices. The structure returned has its reference count incremented, and after the caller is finished with it, the function pci_dev_put must be called.
+
+```c
+int pci_read_config_byte(struct pci_dev *dev, int where, u8 val);
+int pci_read_config_word(struct pci_dev *dev, int where, u16 val);
+int pci_read_config_dword(struct pci_dev *dev, int where, u32 val);
+int pci_write_config_byte (struct pci_dev *dev, int where, u8 *val);
+int pci_write_config_word (struct pci_dev *dev, int where, u16 *val);
+int pci_write_config_dword (struct pci_dev *dev, int where, u32 *val);
+```
+
+Functions that read or write a PCI configuration register. Although the Linux kernel takes care of byte ordering, the programmer must be careful about byte ordering when assembling multibyte values from individual bytes. The PCI bus is little-endian.
+int pci_enable_device(struct pci_dev \*dev);
+Enables a PCI device.
+
+```c
+unsigned long pci_resource_start(struct pci_dev *dev, int bar);
+unsigned long pci_resource_end(struct pci_dev *dev, int bar);
+unsigned long pci_resource_flags(struct pci_dev *dev, int bar);
+```
+
+Functions that handle PCI device resources.
