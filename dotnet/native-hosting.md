@@ -88,6 +88,83 @@
 
 **主线思路**就是：宿主(原生进程) -> `hostfxr` -> `hostpolicy` -> `coreclr` -> 加载并执行 managed assembly。
 
+```mermaid
+flowchart TB
+    A([apphost / dotnet.exe]) --> B([hostfxr.dll])
+    B --> C([hostpolicy.dll])
+    C --> D([coreclr.dll])
+    D --> E([Managed_Assembly])
+
+    style A fill:#fff,stroke:#777,stroke-width:1px,color:#333
+    style B fill:#fff,stroke:#777,stroke-width:1px,color:#333
+    style C fill:#fff,stroke:#777,stroke-width:1px,color:#333
+    style D fill:#fff,stroke:#777,stroke-width:1px,color:#333
+    style E fill:#fff,stroke:#777,stroke-width:1px,color:#333
+
+    A:::host
+    B:::host
+    C:::host
+    D:::runtime
+    E:::managed
+
+    classDef host fill:#e6ffee,stroke:#028482,color:#000
+    classDef runtime fill:#fff2e6,stroke:#c66b12,color:#000
+    classDef managed fill:#e7e9ff,stroke:#4e58b2,color:#000
+
+    subgraph "启动流程"
+      A -->|Initialize config<br/>parse .runtimeconfig.json| B
+      B -->|Load & call hostpolicy| C
+      C -->|Initialize .NET Runtime<br/>parse .deps.json| D
+      D -->|Load & JIT<br/>Managed IL| E
+    end
+
+```
+
+```mermaid
+sequenceDiagram
+    participant App as apphost/dotnet.exe
+    participant Fxr as hostfxr.dll
+    participant Pol as hostpolicy.dll
+    participant CLR as coreclr.dll
+    participant Mng as MyApp.dll (Managed IL)
+    participant CHost as CustomHost(C/C++ EXE)
+    participant Lib as SampleLib.dll (Managed IL)
+    
+    Note over App: (1) 启动 .NET 应用 (CLI / 自包含EXE)
+    App->>Fxr: hostfxr_initialize_for_runtime_config(...)
+    Fxr->>Pol: 加载并调用 hostpolicy
+    
+    Pol->>CLR: coreclr_initialize()
+    CLR->>Mng: 加载 MyApp.dll (IL+Metadata)
+    Note over CLR,Mng: 首次调用 -> JIT 编译
+    Mng->>CLR: IL -> 机器码 (存于JIT code heap)
+    CLR-->>Mng: 执行MyApp代码 (Main / 其他方法)
+    
+   
+
+    Note over CHost: (2) 自定义宿主的Native Hosting流程 (同进程)
+    CHost->>Fxr: hostfxr_initialize_for_runtime_config(...)
+    Fxr->>Pol: get_runtime_delegate(load_assembly_and_get_function_pointer)
+    
+    Pol->>CLR: create_delegate("System.Private.CoreLib",<br/>"ComponentActivator","LoadAssemblyAndGetFunctionPointer")
+    CLR-->>Pol: 返回托管静态方法指针
+    Pol-->>CHost: 返回fnPtr(函数指针)
+    
+    Note over CHost,Pol: fnPtr是托管侧 LoadAssemblyAndGetFunctionPointer
+
+    CHost->>fnPtr: 调用该函数指针<br/>请求加载 SampleLib.dll
+    fnPtr->>CLR: CLR 内部装载 & JIT 编译 SampleLib.dll
+    CLR-->>CHost: 返回目标方法指针
+    
+    CHost->>CLR: (后续多次调用托管方法)
+    CLR-->>CHost: 方法执行结果
+    
+
+
+```
+
+
+
 ---
 
 ## Native Hosting 与 `create_delegate`
