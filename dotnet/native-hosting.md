@@ -1,31 +1,6 @@
-# .NET Runtime Hosting & 托管执行生命周期详解
+# .NET Native Hosting 和托管程序集的交互
 
-本文档从应用程序（.NET）的编译、运行流程入手，系统地介绍了 `.NET Runtime` 内部的一系列组件（如 `apphost`, `hostfxr`, `hostpolicy`, `coreclr`）在托管程序集的执行过程中的协作关系，同时也概括了 JIT 与 AOT、Native Hosting 场景下的异同及关键原理。文档后半部分也对托管类型在 CLR 内部的表示方式（MethodTable / TypeHandle）做了概括性说明。
-
----
-
-## 目录
-
-- [.NET Runtime Hosting \& 托管执行生命周期详解](#net-runtime-hosting--托管执行生命周期详解)
-  - [目录](#目录)
-  - [概述：从启动到执行](#概述从启动到执行)
-  - [关键组件与角色](#关键组件与角色)
-    - [2.1 apphost](#21-apphost)
-    - [2.2 hostfxr](#22-hostfxr)
-    - [2.3 hostpolicy](#23-hostpolicy)
-    - [2.4 coreclr](#24-coreclr)
-    - [2.5 managed assembly](#25-managed-assembly)
-  - [应用程序生命周期：启动流程与模块协作](#应用程序生命周期启动流程与模块协作)
-  - [Native Hosting 与 `create_delegate`](#native-hosting-与-create_delegate)
-    - [4.1 `load_assembly_and_get_function_pointer` 简述](#41-load_assembly_and_get_function_pointer-简述)
-  - [托管代码执行机制：JIT \& AOT](#托管代码执行机制jit--aot)
-    - [JIT (Just-In-Time)](#jit-just-in-time)
-    - [AOT (Ahead-Of-Time)](#aot-ahead-of-time)
-  - [CLR 中的托管类型：MethodTable / TypeHandle](#clr-中的托管类型methodtable--typehandle)
-    - [6.1 C# 类与 CLR 内部结构的对应](#61-c-类与-clr-内部结构的对应)
-    - [6.2 并非“C#类 -\> C++类”](#62-并非c类---c类)
-  - [参考链接 \& 示例位置](#参考链接--示例位置)
-    - [完](#完)
+本文档从应用程序（.NET）的编译、运行切入，系统地介绍了 .net native hosting 技术如何通过一系列组件（如 `apphost`, `hostfxr`, `hostpolicy`, `coreclr`）的协作来达到自定义执行托管程序集，同时也概括了 JIT 与 AOT场景下的异同及关键原理。文档后半部分也对托管类型在 CLR 内部的表示方式（MethodTable / TypeHandle）做了概括性说明。
 
 ---
 
@@ -39,11 +14,11 @@
 
 ## 关键组件与角色
 
-### 2.1 apphost
+### apphost
 - **apphost** 是一种生成好的原生启动器（exe），由 .NET SDK 在发布阶段生成。  
 - 当你发布自包含的 .NET 应用程序（`dotnet publish -r <rid> -p:PublishSingleFile=true`）时，SDK 会把 `hostfxr`、`hostpolicy` 等打包进最终的单文件 exe（这也是“apphost”）。用户双击该 exe，就相当于先启动了原生主程序，再进入到后续的 .NET runtime 初始化流程。
 
-### 2.2 hostfxr
+### hostfxr
 - **hostfxr**（如 `hostfxr.dll` / `.so`）是最外层的 Hosting API 库，它负责：  
   1. **解析** 应用的 `.runtimeconfig.json`、.NET 版本、依赖信息；  
   2. **定位并加载** `hostpolicy`；  
@@ -51,19 +26,19 @@
 
 - 在“命令行执行”场景里，是 `dotnet.exe` 先加载 `hostfxr` 并调用其初始化逻辑。
 
-### 2.3 hostpolicy
+### hostpolicy
 - **hostpolicy**（如 `hostpolicy.dll` / `.so`）是宿主策略库，它承接 `hostfxr` 的调用，进一步负责：
   - 读取并处理 **依赖解析**（依赖 `.deps.json` 里的信息）  
   - **启动 coreclr**：加载并初始化 .NET runtime  
   - 暴露出若干内部枚举和接口（如 `coreclr_delegate_type`）给 `hostfxr` 及上层宿主用，用于获取特定的 runtime 委托（delegate）  
 - 在源代码层面可见 [hostpolicy.cpp](https://github.com/dotnet/runtime/blob/main/src/native/corehost/hostpolicy/hostpolicy.cpp) 展示了它如何处理不同类型的 delegate 请求，如 `load_assembly_and_get_function_pointer`。
 
-### 2.4 coreclr
+### coreclr
 - **coreclr**（如 `coreclr.dll` / `.so`）是 .NET 的真正运行时引擎，包含 **JIT**、**GC**、**类型系统**、**线程管理** 等。
 - 对宿主层暴露一些 API（例如 `ICLRRuntimeHost2::CreateDelegate`）来动态获取托管方法的原生调用入口点，或执行托管程序集的 `Main` 方法。
 - 在 .NET 5+ 统一 branding 下，也称 `.NET runtime`。底层仍是 CoreCLR。
 
-### 2.5 managed assembly
+### managed assembly
 - **托管程序集**（.dll / .exe）指我们用 C# 或其他 .NET 语言编译出的 IL+元数据文件。  
 - 最终在 .NET runtime（coreclr）下 JIT 或 AOT 执行。
 
@@ -169,7 +144,7 @@ sequenceDiagram
 
 ## Native Hosting 与 `create_delegate`
 
-### 4.1 `load_assembly_and_get_function_pointer` 简述
+### `load_assembly_and_get_function_pointer` 简述
 
 在“自定义宿主”场景里（也称 **Native Hosting**），我们可能直接用 C/C++ 自己写一个 EXE，然后调用 `hostfxr` API 来手动控制 runtime。流程通常是：
 
@@ -212,7 +187,7 @@ sequenceDiagram
 
 ## CLR 中的托管类型：MethodTable / TypeHandle
 
-### 6.1 C# 类与 CLR 内部结构的对应
+### C# 类与 CLR 内部结构的对应
 
 当我们在 C# 中定义 `class MyClass { ... }`，编译器会生成 IL 和元数据。CoreCLR 加载该程序集后，会在内部为此类分配一个 **MethodTable**（或称 EEClass）结构来描述：
 - 方法列表 / 字段偏移 / 虚函数表指针等
@@ -221,7 +196,7 @@ sequenceDiagram
 **对象实例**在运行时分配于托管堆时，会在其头部存储指向该 `MethodTable` 的指针。  
 调用 `myObj.SomeMethod()` 时，JIT 生成的机器码会根据 `MethodTable` 查找对应的函数入口点。
 
-### 6.2 并非“C#类 -> C++类”
+### 并非“C#类 -> C++类”
 
 **CLR** 虽然用 C++ 实现，但 C# 类不会被编译成一个固定的“C++ struct/class”；而是**元数据驱动 + 运行时动态生成**方式。  
 - 最终在 CLR 内部，是一套专门的原生数据结构来管理 .NET 类型系统。  
@@ -236,7 +211,7 @@ sequenceDiagram
      - 包含 `coreclr_delegate_type` 相关逻辑及 `create_delegate` 示例。  
 
 2. **Native Hosting 示例**  
-   - [dotnet/samples/tree/main/core/hosting/HostWithHostFxr](https://github.com/dotnet/samples/tree/main/core/hosting/HostWithHostFxr)  
+   - https://github.com/dotnet/samples/tree/main/core/hosting
      - 演示如何在原生代码中使用 `hostfxr` / `hostpolicy` 来初始化 .NET runtime 并调用托管方法。
 
 3. **ComponentActivator.LoadAssemblyAndGetFunctionPointer 源码**  
