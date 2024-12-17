@@ -65,10 +65,11 @@
 
 ```mermaid
 flowchart TB
-    A([apphost / dotnet.exe]) --> B([hostfxr.dll])
-    B --> C([hostpolicy.dll])
-    C --> D([coreclr.dll])
-    D --> E([Managed_Assembly])
+    A([apphost / dotnet.exe]) 
+    B([hostfxr.dll])
+    C([hostpolicy.dll])
+    D([coreclr.dll])
+    E([Managed_Assembly])
 
     style A fill:#fff,stroke:#777,stroke-width:1px,color:#333
     style B fill:#fff,stroke:#777,stroke-width:1px,color:#333
